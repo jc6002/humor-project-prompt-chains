@@ -12,14 +12,17 @@ import {
 } from './presets';
 import {
   type SessionKeyOverrides,
+  PAID_IMAGE_KEY_REQUIRED,
   buildGeminiImageCandidateModels,
   buildGeminiTextCandidateModels,
   buildImageStepHttpRequest,
   buildTextStepHttpRequest,
   extractImageStepOutput,
   extractTextStepOutput,
+  isFreeTierImageQuotaError,
   isQuotaOrRateLimitError,
   resolveEffectiveStepCredential,
+  resolvePaidImageKey,
 } from './step-protocols';
 import {
   CHAIN_UUID_PATTERN,
@@ -453,6 +456,9 @@ async function invokeImageStepWithCascade(params: {
   tokens: number;
 }> {
   const { requestedModelId, temperature, prompt, sessionKeys, signal } = params;
+  if (!resolvePaidImageKey(process.env, sessionKeys)) {
+    throw new HttpStatusError(422, PAID_IMAGE_KEY_REQUIRED);
+  }
   const cred = resolveEffectiveStepCredential(
     'gemini',
     requestedModelId,
@@ -498,6 +504,12 @@ async function invokeImageStepWithCascade(params: {
 
       const errObj = (payload.error ?? {}) as Record<string, unknown>;
       lastError = String(errObj.message ?? `HTTP ${resp.status} from ${candidateModel}`);
+      if (isFreeTierImageQuotaError(resp.status, lastError)) {
+        throw new HttpStatusError(
+          422,
+          'Google reports zero free-tier image quota for this key. Use a key from a Gemini API project with billing enabled.'
+        );
+      }
       if (isQuotaOrRateLimitError(resp.status, lastError)) {
         await sleepMs(1400 * (attempt + 1), signal);
         if (attempt === 0) continue;
@@ -588,7 +600,13 @@ export async function* executeHanziChainRunGenerator(params: {
 
   const budgetBefore = await fetchDailyImageBudget(admin);
   const dailyCapReached = !textOnlyPreview && budgetBefore.remaining <= 0;
-  const effectiveTextOnly = textOnlyPreview || dailyCapReached;
+  const paidImageKey = resolvePaidImageKey(process.env, sessionKeys);
+  const effectiveTextOnly = textOnlyPreview || dailyCapReached || !paidImageKey;
+  let imageWarning =
+    !textOnlyPreview && !dailyCapReached && !paidImageKey &&
+    steps.some((step) => step.step_modality === 'image_generation')
+      ? PAID_IMAGE_KEY_REQUIRED
+      : undefined;
 
   const traces: StepExecutionTrace[] = [];
   let totalLatencyMs = 0;
@@ -602,7 +620,7 @@ export async function* executeHanziChainRunGenerator(params: {
     if (signal?.aborted) throw new Error('Run cancelled by user.');
 
     if (step.step_modality === 'image_generation') {
-      if (effectiveTextOnly) {
+      if (effectiveTextOnly || imageWarning) {
         continue;
       }
       const lastText =
@@ -630,7 +648,12 @@ export async function* executeHanziChainRunGenerator(params: {
         prompt: imagePrompt,
         sessionKeys,
         signal,
+      }).catch((error: unknown) => {
+        if (!(error instanceof HttpStatusError) || error.status !== 422) throw error;
+        imageWarning = error.message;
+        return null;
       });
+      if (!imgRes) continue;
 
       generatedMediaUrl = await persistGeneratedSceneMedia(
         admin,
@@ -768,6 +791,7 @@ export async function* executeHanziChainRunGenerator(params: {
     type: 'run_completed',
     run: hydratedRun,
     imageBudget: updatedBudget,
+    imageWarning,
   };
 }
 

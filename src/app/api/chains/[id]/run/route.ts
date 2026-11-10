@@ -32,6 +32,7 @@ export async function POST(request: Request, context: RouteCtx) {
       let finalRun = null;
       let finalBudget = null;
       let mismatchLookup = null;
+      let imageWarning: string | undefined;
 
       for await (const ev of executeHanziChainRunGenerator({
         admin,
@@ -47,6 +48,7 @@ export async function POST(request: Request, context: RouteCtx) {
         } else if (ev.type === 'run_completed') {
           finalRun = ev.run;
           finalBudget = ev.imageBudget;
+          imageWarning = ev.imageWarning;
         }
       }
 
@@ -62,7 +64,7 @@ export async function POST(request: Request, context: RouteCtx) {
       }
 
       return Response.json(
-        { run: finalRun, imageBudget: finalBudget },
+        { run: finalRun, imageBudget: finalBudget, imageWarning },
         { status: 201, headers: { 'Cache-Control': 'no-store' } }
       );
     }

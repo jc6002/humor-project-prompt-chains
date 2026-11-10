@@ -11,6 +11,20 @@ export interface EffectiveStepCredential {
   usedPaidKey: boolean;
 }
 
+export const PAID_IMAGE_KEY_REQUIRED =
+  'Image generation requires a billing-enabled Gemini API key. Add it in Gemini Keys as the Paid Gemini Key.';
+
+export function resolvePaidImageKey(
+  env: Record<string, string | undefined>,
+  sessionKeys?: SessionKeyOverrides
+): string {
+  return sessionKeys?.geminiPaidKey?.trim() || env.GEMINI_PAID_API_KEY?.trim() || '';
+}
+
+export function isFreeTierImageQuotaError(status: number, message: string): boolean {
+  return status === 429 && /free_tier_[a-z_]+,\s*limit:\s*0\b/i.test(message);
+}
+
 export const GEMINI_TEXT_FALLBACK_CASCADE: readonly string[] = [
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
@@ -41,35 +55,25 @@ export function resolveEffectiveStepCredential(
   sessionKeys?: SessionKeyOverrides
 ): EffectiveStepCredential {
   void modelId;
-  const sessionFree = sessionKeys?.geminiFreeKey?.trim() || '';
-  const sessionPaid = sessionKeys?.geminiPaidKey?.trim() || '';
-  const envFree = env.GEMINI_API_KEY?.trim() || '';
-  const envPaid = env.GEMINI_PAID_API_KEY?.trim() || '';
-
+  const paidKey = resolvePaidImageKey(env, sessionKeys);
   if (modality === 'image_generation') {
-    const chosen = sessionPaid || envPaid || sessionFree || envFree;
-    if (!chosen) {
-      throw new Error(
-        'No Gemini API key is configured for Step 4 image generation. Add GEMINI_PAID_API_KEY or open Keys Ready to provide a session key.'
-      );
-    }
-    return {
-      provider,
-      apiKey: chosen,
-      usedPaidKey: Boolean(sessionPaid || envPaid),
-    };
+    if (!paidKey) throw new Error(PAID_IMAGE_KEY_REQUIRED);
+    return { provider, apiKey: paidKey, usedPaidKey: true };
   }
 
-  const chosen = sessionFree || envFree || sessionPaid || envPaid;
+  const sessionFree = sessionKeys?.geminiFreeKey?.trim() || '';
+  const envFree = env.GEMINI_API_KEY?.trim() || '';
+
+  const chosen = sessionFree || envFree || paidKey;
   if (!chosen) {
     throw new Error(
-      'No Gemini API key is configured for text steps. Add GEMINI_API_KEY in .env.local or open Keys Ready to provide a session key.'
+      'No Gemini API key is configured for text steps. Add GEMINI_API_KEY on the server or provide a key in Gemini Keys.'
     );
   }
   return {
     provider,
     apiKey: chosen,
-    usedPaidKey: !sessionFree && !envFree && Boolean(sessionPaid || envPaid),
+    usedPaidKey: !sessionFree && !envFree,
   };
 }
 

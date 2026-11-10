@@ -192,6 +192,7 @@ export type SseRunEvent =
       type: 'run_completed';
       run: PromptChainRunRow;
       imageBudget: DailyImageBudget;
+      imageWarning?: string;
     }
   | {
       type: 'run_error';

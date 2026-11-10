@@ -17,7 +17,7 @@ const { resolveSafeOrigin, resolveSafeNextPath } = await import(
 const { lookupHanziTarget, getHanziDataset, conciseGloss } = await import(
   pathToFileURL(path.join(repoRoot, 'src/lib/hanzi/dataset.ts')).href
 );
-const { HANZI_MODEL_CATALOG, HANZI_METHOD_TABS } = await import(
+const { HANZI_MODEL_CATALOG, HANZI_METHOD_TABS, buildSelectableModels } = await import(
   pathToFileURL(path.join(repoRoot, 'src/lib/chains/presets.ts')).href
 );
 const {
@@ -26,6 +26,7 @@ const {
   buildImageStepHttpRequest,
   buildTextStepHttpRequest,
   extractTextStepOutput,
+  isFreeTierImageQuotaError,
   resolveEffectiveStepCredential,
 } = await import(pathToFileURL(path.join(repoRoot, 'src/lib/chains/step-protocols.ts')).href);
 const {
@@ -146,6 +147,24 @@ test('Locked 5-model catalog (0 high-cost Pro image), Dual-Key routing, zero-thi
     resolveEffectiveStepCredential('gemini', 'gemini-3.1-flash-lite-image', 'image_generation', dualEnv).apiKey,
     'paid-key-b'
   );
+  const freeEnv = { GEMINI_API_KEY: 'free-key-a' };
+  assert.throws(
+    () => resolveEffectiveStepCredential('gemini', 'gemini-3.1-flash-lite-image', 'image_generation', freeEnv, {
+      geminiFreeKey: 'free-session-key',
+      geminiPaidKey: ' ',
+    }),
+    /billing-enabled Gemini API key/
+  );
+  assert.equal(
+    resolveEffectiveStepCredential('gemini', 'gemini-3.1-flash-lite-image', 'image_generation', dualEnv, {
+      geminiPaidKey: ' paid-session-key ',
+    }).apiKey,
+    'paid-session-key'
+  );
+  assert.equal(buildSelectableModels(freeEnv).filter((model) => model.requiresPaidKey && model.available).length, 0);
+  assert.equal(isFreeTierImageQuotaError(429, 'generate_content_free_tier_requests, limit: 0, model: gemini-nano-banana-2.1'), true);
+  assert.equal(isFreeTierImageQuotaError(429, 'generate_content_free_tier_requests, limit: 10'), false);
+  assert.equal(isFreeTierImageQuotaError(429, 'generate_content_paid_tier_requests, limit: 0'), false);
 
   // Flash-lite omits thinkingConfig; gemini-3-flash-preview sets thinkingBudget: 0
   const liteReq = JSON.parse(

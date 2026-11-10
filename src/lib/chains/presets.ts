@@ -186,7 +186,7 @@ export function buildSelectableModels(
   env: Record<string, string | undefined> = process.env
 ): SelectableModelOption[] {
   const freeOk = Boolean(env.GEMINI_API_KEY?.trim() || env.GEMINI_PAID_API_KEY?.trim());
-  const paidOk = Boolean(env.GEMINI_PAID_API_KEY?.trim() || env.GEMINI_API_KEY?.trim());
+  const paidOk = Boolean(env.GEMINI_PAID_API_KEY?.trim());
   return HANZI_MODEL_CATALOG.map((item) => ({
     ...item,
     available: item.requiresPaidKey ? paidOk : freeOk,

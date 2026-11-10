@@ -110,7 +110,7 @@ export function HanziMnemonicStudio({
   const [hanziInput, setHanziInput] = useState<string>(
     initialSelectedRun?.input_premise ?? '猫头鹰'
   );
-  const [textOnlyPreview, setTextOnlyPreview] = useState<boolean>(false);
+  const [preferTextOnly, setPreferTextOnly] = useState(false);
   const [deckScope, setDeckScope] = useState<'chain' | 'all'>(initialDeckScope);
 
   const [lookupPreview, setLookupPreview] = useState<LookupVerdict | null>(null);
@@ -122,6 +122,7 @@ export function HanziMnemonicStudio({
   const [liveLookup, setLiveLookup] = useState<LookupVerdict | null>(null);
   const [liveTraces, setLiveTraces] = useState<StepExecutionTrace[]>([]);
   const [runError, setRunError] = useState<string | null>(null);
+  const [imageWarning, setImageWarning] = useState<string | null>(null);
   const [renderingRunId, setRenderingRunId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -140,6 +141,8 @@ export function HanziMnemonicStudio({
     getServerKeySnapshot
   );
   const [sessionFreeKey, sessionPaidKey] = sessionKeyPair.split('|');
+  const paidImageReady = Boolean(sessionPaidKey || initialData.providerStatus.geminiPaidConfigured);
+  const textOnlyPreview = preferTextOnly || !paidImageReady;
 
   const activeChain = useMemo(
     () => chains.find((c) => c.id === activeChainId) ?? chains[0] ?? null,
@@ -255,6 +258,7 @@ export function HanziMnemonicStudio({
   const mountSavedRun = useCallback((run: PromptChainRunRow) => {
     setMismatchCard(null);
     setRunError(null);
+    setImageWarning(null);
     setInspectedStepOrder(null);
     setSelectedRunId(run.id);
     setHanziInput(run.input_premise);
@@ -284,6 +288,7 @@ export function HanziMnemonicStudio({
       setLiveTraces([]);
       setMismatchCard(null);
       setRunError(null);
+      setImageWarning(null);
       setInspectedStepOrder(null);
 
       try {
@@ -295,7 +300,7 @@ export function HanziMnemonicStudio({
           },
           body: JSON.stringify({
             input: clean,
-            text_only: forceTextOnly ?? textOnlyPreview,
+            text_only: !paidImageReady || (forceTextOnly ?? textOnlyPreview),
             stream: true,
           }),
           signal: controller.signal,
@@ -342,6 +347,7 @@ export function HanziMnemonicStudio({
               setSelectedRunId(ev.run.id);
               setHanziInput(ev.run.input_premise);
               setImageBudget(ev.imageBudget);
+              setImageWarning(ev.imageWarning ?? null);
               setLiveLookup(null);
               setRunningStepOrder(null);
             } else if (ev.type === 'run_error') {
@@ -360,7 +366,7 @@ export function HanziMnemonicStudio({
         setRunningStepOrder(null);
       }
     },
-    [buildSessionHeaders, textOnlyPreview]
+    [buildSessionHeaders, paidImageReady, textOnlyPreview]
   );
 
   const handleSwitchAndRunFittingChain = useCallback(
@@ -389,6 +395,7 @@ export function HanziMnemonicStudio({
     async (run: PromptChainRunRow) => {
       setRenderingRunId(run.id);
       setRunError(null);
+      setImageWarning(null);
       try {
         const resp = await fetch(`/api/runs/${run.id}/render-image`, {
           method: 'POST',
@@ -409,7 +416,7 @@ export function HanziMnemonicStudio({
           setImageBudget(data.imageBudget);
         }
       } catch (err) {
-        setRunError(err instanceof Error ? err.message : 'Scene rendering failed.');
+        setImageWarning(err instanceof Error ? err.message : 'Scene rendering failed.');
       } finally {
         setRenderingRunId(null);
       }
@@ -654,7 +661,7 @@ export function HanziMnemonicStudio({
           >
             <span aria-hidden="true">●</span>
             <span>
-              Keys Ready · {imageBudget.usedToday}/{imageBudget.dailyCap} imgs
+              Gemini Keys · {imageBudget.usedToday}/{imageBudget.dailyCap} imgs
             </span>
           </button>
         }
@@ -917,7 +924,9 @@ export function HanziMnemonicStudio({
                     Text Steps Only ($0 Preview)
                   </div>
                   <div style={{ fontSize: 10.5, color: 'var(--fg-muted)' }}>
-                    Run Steps 1–3 free before spending $0.034
+                    {paidImageReady
+                      ? 'Preview the text steps before rendering a scene.'
+                      : 'Image rendering requires a billing-enabled key in Gemini Keys.'}
                   </div>
                 </div>
                 <button
@@ -926,7 +935,8 @@ export function HanziMnemonicStudio({
                   aria-checked={textOnlyPreview}
                   aria-label="Text Steps Only ($0 Preview)"
                   className="toggle-pill"
-                  onClick={() => setTextOnlyPreview((v) => !v)}
+                  disabled={!paidImageReady}
+                  onClick={() => setPreferTextOnly((v) => !v)}
                 >
                   <span className="toggle-knob" />
                 </button>
@@ -1125,6 +1135,11 @@ export function HanziMnemonicStudio({
                     Retry Run
                   </button>
                 )}
+              </div>
+            )}
+            {imageWarning && (
+              <div className="alert-error" role="status">
+                {imageWarning}
               </div>
             )}
 
@@ -1432,11 +1447,16 @@ export function HanziMnemonicStudio({
                           disabled={
                             renderingRunId === displayedRun.id || imageBudget.remaining <= 0
                           }
-                          onClick={() => void handleRenderPreviewScene(displayedRun)}
+                          onClick={() => {
+                            if (paidImageReady) void handleRenderPreviewScene(displayedRun);
+                            else setKeysDrawerOpen(true);
+                          }}
                         >
                           {renderingRunId === displayedRun.id
                             ? 'Rendering 1:1 Scene…'
-                            : 'Render Scene ($0.034) →'}
+                            : paidImageReady
+                              ? 'Render Scene ($0.034) →'
+                              : 'Add Paid Gemini Key →'}
                         </button>
                       </div>
                     )}
