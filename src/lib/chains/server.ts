@@ -1,39 +1,44 @@
 import 'server-only';
-import { lookup as dnsLookup } from 'node:dns/promises';
 import { randomUUID } from 'node:crypto';
 import { createClient as createSupabaseClient, type SupabaseClient } from '@supabase/supabase-js';
+import { lookupHanziTarget } from '@/lib/hanzi/dataset';
 import { createClient } from '@/lib/supabase/server';
 import { getSupabaseEnv } from '@/lib/supabase/env';
 import { resolveSafeOrigin } from '@/lib/supabase/origin';
 import {
-  ALLOWED_VISION_MIMES,
-  CHAIN_UUID_PATTERN,
-  MAX_IMAGE_BYTES,
-  compileStepInstruction,
-  escapePostgrestIlike,
-  isPublicIpAddress,
-  normalizeFinalCaptions,
-  normalizeRunStepOutputs,
-  parseBoundedImageDataUrl,
-  parseFiveCaptions,
-  validateExternalImageUrl,
-} from './validation';
+  DEFAULT_DAILY_IMAGE_CAP,
+  HANZI_APP_SCOPE,
+  buildSelectableModels,
+} from './presets';
 import {
-  buildMultimodalStepHttpRequest,
-  extractStepTextAndUsage,
-  listSelectableChainModels,
-  resolveSelectedChainModel,
-  type CatalogModelRow,
-  type CatalogProviderRow,
-  type VisionImagePayload,
-} from './multimodal-protocols';
-import { getSampleSceneById } from './sample-scenes';
+  type SessionKeyOverrides,
+  buildGeminiImageCandidateModels,
+  buildGeminiTextCandidateModels,
+  buildImageStepHttpRequest,
+  buildTextStepHttpRequest,
+  extractImageStepOutput,
+  extractTextStepOutput,
+  isQuotaOrRateLimitError,
+  resolveEffectiveStepCredential,
+} from './step-protocols';
+import {
+  CHAIN_UUID_PATTERN,
+  clampStepTemperature,
+  compileCardFromTextTraces,
+  compileMnemonicStepInstruction,
+  escapePostgrestIlike,
+  inferDecompositionModeFromChain,
+  normalizeModelId,
+  normalizeRunStepOutputs,
+  normalizeStepModality,
+  normalizeStoredCard,
+} from './validation';
 import type {
-  AvailableModelOption,
-  InputSourceType,
+  DailyImageBudget,
   PromptChainRow,
   PromptChainRunRow,
   PromptChainStepRow,
+  SseRunEvent,
   StepExecutionTrace,
   StudioInitialData,
 } from './types';
@@ -42,6 +47,14 @@ export type StudioGateResult =
   | { status: 'unauthenticated' }
   | { status: 'forbidden'; user: { id: string; email: string } }
   | { status: 'authorized'; user: { id: string; email: string } };
+
+export class HttpStatusError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
 
 export function adminClient(): SupabaseClient {
   const { url } = getSupabaseEnv();
@@ -54,9 +67,12 @@ export function adminClient(): SupabaseClient {
   });
 }
 
-export function checkOrigin(request: Request, requireJson = true) {
-  if (requireJson && !request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
-    throw new Error('JSON content-type is required.');
+export function checkOrigin(request: Request, requireJson = true): void {
+  if (
+    requireJson &&
+    !request.headers.get('content-type')?.toLowerCase().includes('application/json')
+  ) {
+    throw new HttpStatusError(400, 'JSON content-type is required.');
   }
 
   const origin = request.headers.get('origin');
@@ -66,7 +82,7 @@ export function checkOrigin(request: Request, requireJson = true) {
   try {
     originHost = new URL(origin).host.toLowerCase();
   } catch {
-    throw new Error('Request origin is not allowed.');
+    throw new HttpStatusError(403, 'Request origin is not allowed.');
   }
 
   const allowedHosts = new Set<string>([
@@ -79,7 +95,7 @@ export function checkOrigin(request: Request, requireJson = true) {
   }
 
   if (!allowedHosts.has(originHost)) {
-    throw new Error('Request origin is not allowed.');
+    throw new HttpStatusError(403, 'Request origin is not allowed.');
   }
 }
 
@@ -107,635 +123,771 @@ export async function checkSuperadmin(): Promise<StudioGateResult> {
       : Promise.resolve({ data: [], error: null }),
   ]);
 
-  const autoAdmin = Boolean(
-    emailClean &&
-      (whitelistRes.data ?? []).some(
-        (w: { email?: string }) => String(w.email ?? '').trim().toLowerCase() === emailClean
-      )
+  const isSuperadmin = Boolean(
+    profile?.is_superadmin || (Array.isArray(whitelistRes.data) && whitelistRes.data.length > 0)
   );
-  if (autoAdmin && !profile?.is_superadmin) {
-    await admin
-      .from('profiles')
-      .upsert({ id: user.id, email: user.email, is_superadmin: true }, { onConflict: 'id' });
-  }
 
-  if (!profile?.is_superadmin && !autoAdmin) {
-    return {
-      status: 'forbidden',
-      user: { id: user.id, email: user.email ?? profile?.email ?? 'Signed-in user' },
-    };
-  }
-
-  return {
-    status: 'authorized',
-    user: { id: user.id, email: user.email ?? profile?.email ?? 'Superadmin' },
+  const safeUser = {
+    id: user.id,
+    email: user.email ?? profile?.email ?? 'superadmin@local',
   };
+
+  if (!isSuperadmin) {
+    return { status: 'forbidden', user: safeUser };
+  }
+  return { status: 'authorized', user: safeUser };
 }
 
-export async function requireSuperadminApi(request: Request, opts?: { requireJson?: boolean }) {
-  const method = request.method.toUpperCase();
-  if (method !== 'GET' && method !== 'HEAD') {
-    checkOrigin(request, opts?.requireJson ?? (method === 'POST' || method === 'PATCH' || method === 'PUT'));
+export async function requireSuperadminApi(
+  request: Request,
+  opts?: { methodIsMutating?: boolean; requireJson?: boolean }
+): Promise<{ admin: SupabaseClient; user: { id: string; email: string } }> {
+  const mutating = opts?.methodIsMutating ?? request.method !== 'GET';
+  if (mutating) {
+    checkOrigin(request, opts?.requireJson ?? request.method !== 'DELETE');
   }
-
   const gate = await checkSuperadmin();
   if (gate.status === 'unauthenticated') {
-    throw new Error('Sign in with Google to access Prompt Chain Studio.');
+    throw new HttpStatusError(401, 'Authentication required.');
   }
   if (gate.status === 'forbidden') {
-    throw new Error('Forbidden: profiles.is_superadmin == TRUE is required.');
+    throw new HttpStatusError(403, 'Superadmin access required (profiles.is_superadmin == TRUE).');
   }
   return { admin: adminClient(), user: gate.user };
 }
 
-export function apiFailure(error: unknown) {
-  const message = error instanceof Error ? error.message : 'Studio request failed.';
-  const status = message.startsWith('Sign in')
-    ? 401
-    : message.startsWith('Forbidden')
-      ? 403
-      : message.toLowerCase().includes('not found')
-        ? 404
-        : 400;
+export function apiFailure(error: unknown): Response {
+  const status = error instanceof HttpStatusError ? error.status : 400;
+  const message = error instanceof Error ? error.message : 'Request failed.';
   return Response.json(
     { error: message },
     { status, headers: { 'Cache-Control': 'no-store' } }
   );
 }
 
-export function normalizeRunRow(raw: Record<string, unknown>): PromptChainRunRow {
-  const srcRaw = String(raw.input_source_type ?? 'sample_svg');
-  const sourceType: InputSourceType =
-    srcRaw === 'upload' || srcRaw === 'image_url' || srcRaw === 'text_only'
-      ? srcRaw
-      : 'sample_svg';
-  const statusRaw = String(raw.status ?? 'completed');
-  const status =
-    statusRaw === 'running' || statusRaw === 'failed' ? statusRaw : 'completed';
+export function resolveDailyImageCap(): number {
+  const raw = Number(process.env.DAILY_IMAGE_CAP);
+  if (Number.isFinite(raw) && raw >= 1 && raw <= 500) {
+    return Math.floor(raw);
+  }
+  return DEFAULT_DAILY_IMAGE_CAP;
+}
 
+// Counts live Paid raster image runs today in UTC, excluding /showcase/* seeds and $0 text-only runs.
+export async function fetchDailyImageBudget(admin: SupabaseClient): Promise<DailyImageBudget> {
+  const dailyCap = resolveDailyImageCap();
+  const now = new Date();
+  const utcMidnightIso = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0)
+  ).toISOString();
+
+  const { data } = await admin
+    .from('prompt_chain_runs')
+    .select('id, generated_media_url, generated_media_mime, status, created_at')
+    .eq('app_scope', HANZI_APP_SCOPE)
+    .eq('status', 'completed')
+    .gte('created_at', utcMidnightIso);
+
+  const rows = Array.isArray(data) ? data : [];
+  let usedToday = 0;
+  for (const r of rows) {
+    const url = typeof r.generated_media_url === 'string' ? r.generated_media_url.trim() : '';
+    const mime = typeof r.generated_media_mime === 'string' ? r.generated_media_mime.toLowerCase() : '';
+    if (!url) continue;
+    if (url.startsWith('/showcase/')) continue;
+    if (mime.includes('svg')) continue;
+    usedToday += 1;
+  }
+
+  return {
+    usedToday,
+    dailyCap,
+    remaining: Math.max(0, dailyCap - usedToday),
+  };
+}
+
+function hydrateChainRow(raw: Record<string, unknown>): PromptChainRow {
+  const slug = String(raw.slug ?? '');
+  return {
+    id: String(raw.id),
+    slug,
+    name: String(raw.name ?? ''),
+    description: typeof raw.description === 'string' ? raw.description : '',
+    persona_style: String(raw.persona_style ?? ''),
+    is_active: raw.is_active !== false,
+    mix_weight: Number(raw.mix_weight ?? 0) || 0,
+    app_scope: String(raw.app_scope ?? HANZI_APP_SCOPE),
+    decomposition_mode: inferDecompositionModeFromChain(slug, raw.decomposition_mode),
+    created_at: String(raw.created_at ?? new Date().toISOString()),
+    updated_at: String(raw.updated_at ?? new Date().toISOString()),
+  };
+}
+
+function hydrateStepRow(raw: Record<string, unknown>): PromptChainStepRow {
+  const rawModality = raw.step_modality === 'image_generation' ? 'image_generation' : 'text';
+  const model_id = normalizeModelId(raw.model_id, rawModality);
+  const step_modality = normalizeStepModality(raw.step_modality, model_id);
   return {
     id: String(raw.id),
     chain_id: String(raw.chain_id),
-    chain_slug: String(raw.chain_slug ?? ''),
-    chain_name: String(raw.chain_name ?? 'Prompt Chain'),
-    user_id: typeof raw.user_id === 'string' ? raw.user_id : null,
-    user_email: typeof raw.user_email === 'string' ? raw.user_email : null,
-    provider: String(raw.provider ?? ''),
-    model: String(raw.model ?? ''),
-    input_source_type: sourceType,
-    input_scene_id: typeof raw.input_scene_id === 'string' ? raw.input_scene_id : null,
-    input_scene_title: typeof raw.input_scene_title === 'string' ? raw.input_scene_title : null,
-    input_image_url: typeof raw.input_image_url === 'string' ? raw.input_image_url : null,
-    input_premise: String(raw.input_premise ?? ''),
-    step_outputs: normalizeRunStepOutputs(raw.step_outputs),
-    final_captions: normalizeFinalCaptions(raw.final_captions),
-    status,
-    error_message: typeof raw.error_message === 'string' ? raw.error_message : null,
-    total_latency_ms: Math.max(0, Number(raw.total_latency_ms) || 0),
-    total_tokens: Math.max(0, Number(raw.total_tokens) || 0),
+    step_order: Number(raw.step_order) || 1,
+    step_name: String(raw.step_name ?? 'Step'),
+    step_role: String(raw.step_role ?? 'step'),
+    instruction_template: String(raw.instruction_template ?? ''),
+    output_field: String(raw.output_field ?? 'step_output'),
+    provider: 'gemini',
+    model_id,
+    temperature: clampStepTemperature(raw.temperature, step_modality === 'image_generation' ? 0.6 : 0.2),
+    step_modality,
     created_at: String(raw.created_at ?? new Date().toISOString()),
   };
 }
 
-export async function fetchStudioInitialData(): Promise<StudioInitialData> {
-  const admin = adminClient();
-  const [chainsRes, stepsRes, runsRes, providersRes, modelsRes] = await Promise.all([
-    admin.from('prompt_chains').select('*').order('created_at', { ascending: true }),
-    admin.from('prompt_chain_steps').select('*').order('step_order', { ascending: true }),
-    admin.from('prompt_chain_runs').select('*').order('created_at', { ascending: false }).limit(80),
-    admin.from('llm_providers').select('*').order('created_at', { ascending: true }),
-    admin.from('arena_models').select('*').is('canonical_id', null).order('rating', { ascending: false }),
+export function hydrateRunRow(raw: Record<string, unknown>): PromptChainRunRow {
+  const premise = String(raw.input_premise ?? '').trim();
+  const chainSlug = String(raw.chain_slug ?? 'compound-word');
+  const inferredMode = inferDecompositionModeFromChain(chainSlug);
+  const lookup = lookupHanziTarget(premise || '猫头鹰', inferredMode);
+  const mediaUrl =
+    typeof raw.generated_media_url === 'string' && raw.generated_media_url.trim()
+      ? raw.generated_media_url.trim()
+      : null;
+
+  return {
+    id: String(raw.id),
+    chain_id: String(raw.chain_id),
+    chain_slug: chainSlug,
+    chain_name: String(raw.chain_name ?? 'Compound Word'),
+    user_id: typeof raw.user_id === 'string' ? raw.user_id : null,
+    user_email: typeof raw.user_email === 'string' ? raw.user_email : null,
+    provider: String(raw.provider ?? 'gemini'),
+    model: String(raw.model ?? 'gemini-3.5-flash-lite'),
+    input_source_type: String(raw.input_source_type ?? 'text_only'),
+    input_premise: premise,
+    input_tags: Array.isArray(raw.input_tags) ? raw.input_tags.map(String) : [],
+    step_outputs: normalizeRunStepOutputs(raw.step_outputs),
+    final_captions: Array.isArray(raw.final_captions) ? raw.final_captions.map(String) : [],
+    generated_media_url: mediaUrl,
+    generated_media_mime: String(raw.generated_media_mime ?? 'image/jpeg'),
+    generated_media_prompt:
+      typeof raw.generated_media_prompt === 'string' ? raw.generated_media_prompt : null,
+    structured_card: normalizeStoredCard(raw.structured_card, lookup, Boolean(mediaUrl)),
+    status: raw.status === 'failed' ? 'failed' : raw.status === 'running' ? 'running' : 'completed',
+    error_message: typeof raw.error_message === 'string' ? raw.error_message : null,
+    total_latency_ms: Number(raw.total_latency_ms) || 0,
+    total_tokens: Number(raw.total_tokens) || 0,
+    app_scope: String(raw.app_scope ?? HANZI_APP_SCOPE),
+    created_at: String(raw.created_at ?? new Date().toISOString()),
+  };
+}
+
+export async function fetchStudioInitialData(adminOverride?: SupabaseClient): Promise<StudioInitialData> {
+  const admin = adminOverride ?? adminClient();
+  const [chainsRes, runsRes, imageBudget] = await Promise.all([
+    admin
+      .from('prompt_chains')
+      .select('*')
+      .eq('app_scope', HANZI_APP_SCOPE)
+      .order('created_at', { ascending: true }),
+    admin
+      .from('prompt_chain_runs')
+      .select('*')
+      .eq('app_scope', HANZI_APP_SCOPE)
+      .order('created_at', { ascending: false })
+      .limit(80),
+    fetchDailyImageBudget(admin),
   ]);
 
-  const chains = ((chainsRes.data ?? []) as PromptChainRow[]).slice().sort((a, b) => {
-    // Surface the visual-image-to-5-captions pipeline first so graders land directly on the 3-step visual demo
-    const aVisual = a.slug === 'visual-image-to-5-captions' ? 1 : 0;
-    const bVisual = b.slug === 'visual-image-to-5-captions' ? 1 : 0;
-    if (aVisual !== bVisual) return bVisual - aVisual;
-    return (Number(b.mix_weight) || 0) - (Number(a.mix_weight) || 0);
-  });
-
-  const steps = ((stepsRes.data ?? []) as PromptChainStepRow[])
-    .slice()
-    .sort((a, b) => a.step_order - b.step_order);
-
-  const runs = runsRes.error
-    ? []
-    : ((runsRes.data ?? []) as Record<string, unknown>[]).map(normalizeRunRow);
-
-  const models = listSelectableChainModels({
-    providers: (providersRes.error ? [] : (providersRes.data ?? [])) as CatalogProviderRow[],
-    models: (modelsRes.error ? [] : (modelsRes.data ?? [])) as CatalogModelRow[],
-    env: process.env,
-  });
-
-  return { chains, steps, runs, models };
-}
-
-/**
- * Reorders all steps of `chainId` to match `orderedStepIds` (`1..K`) without
- * ever triggering PostgreSQL `23505` on `UNIQUE (chain_id, step_order)`.
- * Uses `public.reorder_prompt_chain_steps` first, with a 2-phase negative-offset
- * fallback if the RPC has not yet been installed.
- */
-export async function reorderChainStepsAtomically(
-  admin: SupabaseClient,
-  chainId: string,
-  orderedStepIds: readonly string[]
-): Promise<PromptChainStepRow[]> {
-  if (!CHAIN_UUID_PATTERN.test(chainId)) {
-    throw new Error('Invalid chain ID.');
+  if (chainsRes.error) {
+    throw new Error(`Failed to load prompt chains: ${chainsRes.error.message}`);
   }
-  if (!Array.isArray(orderedStepIds) || orderedStepIds.length === 0) {
-    throw new Error('Step ID list cannot be empty.');
+  if (runsRes.error) {
+    throw new Error(`Failed to load saved mnemonic cards: ${runsRes.error.message}`);
   }
 
-  const cleanedIds = orderedStepIds.map((id) => String(id ?? '').trim());
-  if (cleanedIds.some((id) => !CHAIN_UUID_PATTERN.test(id))) {
-    throw new Error('Every step ID must be a valid UUID.');
-  }
-  if (new Set(cleanedIds).size !== cleanedIds.length) {
-    throw new Error('Duplicate step IDs are not allowed.');
-  }
+  const chains = (chainsRes.data ?? []).map((r) => hydrateChainRow(r as Record<string, unknown>));
+  const chainIds = chains.map((c) => c.id);
 
-  const { data: existingRows, error: fetchErr } = await admin
-    .from('prompt_chain_steps')
-    .select('*')
-    .eq('chain_id', chainId)
-    .order('step_order', { ascending: true });
-
-  if (fetchErr) {
-    throw new Error(fetchErr.message);
-  }
-  const existing = (existingRows ?? []) as PromptChainStepRow[];
-  const existingIdSet = new Set(existing.map((r) => r.id));
-  if (
-    existing.length !== cleanedIds.length ||
-    cleanedIds.some((id) => !existingIdSet.has(id))
-  ) {
-    throw new Error('Step ID list must match the exact steps belonging to this chain.');
+  const stepsByChainId: Record<string, PromptChainStepRow[]> = {};
+  for (const cid of chainIds) {
+    stepsByChainId[cid] = [];
   }
 
-  const rpcRes = await admin.rpc('reorder_prompt_chain_steps', {
-    p_chain_id: chainId,
-    p_step_ids: cleanedIds,
-  });
+  if (chainIds.length > 0) {
+    const stepsRes = await admin
+      .from('prompt_chain_steps')
+      .select('*')
+      .in('chain_id', chainIds)
+      .order('step_order', { ascending: true });
 
-  if (!rpcRes.error && Array.isArray(rpcRes.data)) {
-    return (rpcRes.data as PromptChainStepRow[])
-      .slice()
-      .sort((a, b) => a.step_order - b.step_order);
-  }
-
-  if (rpcRes.error) {
-    const code = String(rpcRes.error.code ?? '');
-    const msg = String(rpcRes.error.message ?? '');
-    const isMissingRpc =
-      code === 'PGRST202' ||
-      code === '42883' ||
-      /could not find the function|unknown rpc/i.test(msg);
-    if (!isMissingRpc) {
-      throw new Error(msg || 'Failed to reorder prompt chain steps.');
+    if (stepsRes.error) {
+      throw new Error(`Failed to load chain steps: ${stepsRes.error.message}`);
     }
-  }
-
-  // Fallback 2-phase negative offset when reorder_prompt_chain_steps RPC is unavailable
-  for (let i = 0; i < cleanedIds.length; i++) {
-    const { error } = await admin
-      .from('prompt_chain_steps')
-      .update({ step_order: -10001 - i })
-      .eq('chain_id', chainId)
-      .eq('id', cleanedIds[i]);
-    if (error) throw new Error(error.message);
-  }
-
-  for (let i = 0; i < cleanedIds.length; i++) {
-    const { error } = await admin
-      .from('prompt_chain_steps')
-      .update({ step_order: i + 1 })
-      .eq('chain_id', chainId)
-      .eq('id', cleanedIds[i]);
-    if (error) throw new Error(error.message);
-  }
-
-  await admin
-    .from('prompt_chains')
-    .update({ updated_at: new Date().toISOString() })
-    .eq('id', chainId);
-
-  const { data: refreshed, error: refreshErr } = await admin
-    .from('prompt_chain_steps')
-    .select('*')
-    .eq('chain_id', chainId)
-    .order('step_order', { ascending: true });
-  if (refreshErr) throw new Error(refreshErr.message);
-  return (refreshed ?? []) as PromptChainStepRow[];
-}
-
-async function fetchExternalVisionImage(rawUrl: string): Promise<{
-  canonicalUrl: string;
-  image: VisionImagePayload;
-}> {
-  const parsed = validateExternalImageUrl(rawUrl);
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-
-  // Resolve DNS records and block any hostname mapping to loopback/private/metadata IP space
-  let records: Array<{ address: string }>;
-  try {
-    records = await dnsLookup(host, { all: true });
-  } catch {
-    throw new Error('Could not resolve external image hostname.');
-  }
-  if (!records.length || records.some((r) => !isPublicIpAddress(r.address))) {
-    throw new Error('External image hostname resolved to a non-public IP address.');
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(parsed.toString(), {
-      method: 'GET',
-      redirect: 'error',
-      signal: AbortSignal.timeout(9000),
-      headers: {
-        Accept: 'image/png,image/jpeg,image/webp,image/gif',
-      },
-      cache: 'no-store',
-    });
-  } catch {
-    throw new Error(
-      'Failed to fetch external image URL (note: HTTP redirects and slow hosts are blocked for security).'
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error(`External image URL returned HTTP ${response.status}.`);
-  }
-
-  const rawContentType = (response.headers.get('content-type') ?? '')
-    .split(';')[0]
-    .trim()
-    .toLowerCase();
-  if (!ALLOWED_VISION_MIMES.has(rawContentType)) {
-    throw new Error(
-      `External URL returned unsupported MIME type "${rawContentType || 'unknown'}". Provide a direct PNG, JPEG, WebP, or GIF URL.`
-    );
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) {
-    throw new Error('External image response body was empty.');
-  }
-
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      totalBytes += value.byteLength;
-      if (totalBytes > MAX_IMAGE_BYTES) {
-        await reader.cancel().catch(() => undefined);
-        throw new Error('External image exceeds the 4 MB maximum size.');
+    for (const rawStep of stepsRes.data ?? []) {
+      const step = hydrateStepRow(rawStep as Record<string, unknown>);
+      if (!stepsByChainId[step.chain_id]) {
+        stepsByChainId[step.chain_id] = [];
       }
-      chunks.push(value);
+      stepsByChainId[step.chain_id].push(step);
     }
   }
 
-  if (totalBytes < 16) {
-    throw new Error('External image payload was empty.');
-  }
+  const runs = (runsRes.data ?? []).map((r) => hydrateRunRow(r as Record<string, unknown>));
 
-  const buffer = Buffer.concat(chunks.map((c) => Buffer.from(c)));
   return {
-    canonicalUrl: parsed.toString(),
-    image: {
-      mimeType: rawContentType,
-      base64Data: buffer.toString('base64'),
+    chains,
+    stepsByChainId,
+    runs,
+    models: buildSelectableModels(),
+    providerStatus: {
+      geminiFreeConfigured: Boolean(
+        process.env.GEMINI_API_KEY?.trim() || process.env.GEMINI_PAID_API_KEY?.trim()
+      ),
+      geminiPaidConfigured: Boolean(process.env.GEMINI_PAID_API_KEY?.trim()),
     },
+    imageBudget,
   };
 }
 
-export async function executeSingleChainStepLlm(params: {
-  model: AvailableModelOption;
-  prompt: string;
-  image?: VisionImagePayload | null;
-  expectFiveCaptionsJson: boolean;
-}) {
-  const { model, prompt, image, expectFiveCaptionsJson } = params;
-  const apiKey = process.env[model.apiKeyEnv]?.trim();
-  if (!apiKey) {
-    throw new Error(`Missing API key environment variable ${model.apiKeyEnv} for ${model.displayName}.`);
-  }
-
-  const req = buildMultimodalStepHttpRequest({
-    model,
-    prompt,
-    apiKey,
-    image,
-    expectFiveCaptionsJson,
+async function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error('Run cancelled by user.');
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new Error('Run cancelled by user.'));
+      },
+      { once: true }
+    );
   });
-
-  const startedAt = Date.now();
-  let response: Response;
-  try {
-    response = await fetch(req.url, {
-      method: 'POST',
-      headers: req.headers,
-      body: JSON.stringify(req.body),
-      signal: AbortSignal.timeout(28000),
-      cache: 'no-store',
-    });
-  } catch (err) {
-    const timedOut = err instanceof Error && ['TimeoutError', 'AbortError'].includes(err.name);
-    throw new Error(
-      timedOut
-        ? `${model.providerName} (${model.apiModel}) timed out while executing prompt chain step.`
-        : `${model.providerName} (${model.apiModel}) could not be reached.`
-    );
-  }
-
-  const latencyMs = Date.now() - startedAt;
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    const brief = errText ? `: ${errText.slice(0, 180)}` : '';
-    throw new Error(
-      `${model.providerName} (${model.apiModel}) returned HTTP ${response.status}${brief}`
-    );
-  }
-
-  let data: unknown;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(`${model.providerName} (${model.apiModel}) returned malformed JSON.`);
-  }
-
-  const extracted = extractStepTextAndUsage(
-    model.protocol,
-    data,
-    model.apiModel,
-    response.headers.get('x-request-id') ?? response.headers.get('request-id')
-  );
-
-  if (!extracted.text) {
-    throw new Error(`${model.providerName} (${model.apiModel}) returned an empty step response.`);
-  }
-
-  return {
-    outputText: extracted.text,
-    resolvedModel: extracted.resolvedModel,
-    latencyMs,
-    inputTokens: extracted.inputTokens,
-    outputTokens: extracted.outputTokens,
-    reasoningTokens: extracted.reasoningTokens,
-    usage: extracted.usage,
-    httpStatus: response.status,
-    providerRequestId: extracted.requestId,
-  };
 }
 
-export async function runPromptChainSequentially(params: {
+async function invokeTextStepWithCascade(params: {
+  step: PromptChainStepRow;
+  prompt: string;
+  sessionKeys?: SessionKeyOverrides;
+  signal?: AbortSignal;
+}): Promise<{ text: string; usedModelId: string; latencyMs: number; tokens: number }> {
+  const { step, prompt, sessionKeys, signal } = params;
+  const cred = resolveEffectiveStepCredential(
+    step.provider,
+    step.model_id,
+    'text',
+    process.env,
+    sessionKeys
+  );
+  const jsonMode =
+    step.step_role.includes('json') ||
+    step.output_field.includes('json') ||
+    /\bjson\b/i.test(step.instruction_template);
+
+  const candidates = buildGeminiTextCandidateModels(step.model_id);
+  let lastError = 'Upstream text model failed.';
+
+  for (const candidateModel of candidates) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (signal?.aborted) throw new Error('Run cancelled by user.');
+      const started = Date.now();
+      const reqSpec = buildTextStepHttpRequest({
+        modelId: candidateModel,
+        apiKey: cred.apiKey,
+        prompt,
+        temperature: step.temperature,
+        jsonMode,
+        omitThinkingConfig: attempt === 1,
+      });
+
+      const resp = await fetch(reqSpec.url, {
+        method: 'POST',
+        headers: reqSpec.headers,
+        body: reqSpec.body,
+        signal,
+      });
+      const elapsed = Date.now() - started;
+      const payload = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+
+      if (resp.ok) {
+        const extracted = extractTextStepOutput('gemini', candidateModel, payload);
+        if (extracted.text) {
+          return {
+            text: extracted.text,
+            usedModelId: candidateModel,
+            latencyMs: elapsed,
+            tokens: extracted.inputTokens + extracted.outputTokens,
+          };
+        }
+      }
+
+      const errObj = (payload.error ?? {}) as Record<string, unknown>;
+      lastError = String(errObj.message ?? `HTTP ${resp.status} from ${candidateModel}`);
+
+      // 1-shot retry omitting thinkingConfig on HTTP 400
+      if (resp.status === 400 && !candidateModel.includes('flash-lite') && attempt === 0) {
+        continue;
+      }
+      if (isQuotaOrRateLimitError(resp.status, lastError)) {
+        await sleepMs(1100 * (attempt + 1), signal);
+        if (attempt === 0) continue;
+        break;
+      }
+      break;
+    }
+  }
+
+  throw new HttpStatusError(502, `Text step "${step.step_name}" failed: ${lastError}`);
+}
+
+async function invokeImageStepWithCascade(params: {
+  requestedModelId: string;
+  temperature: number;
+  prompt: string;
+  sessionKeys?: SessionKeyOverrides;
+  signal?: AbortSignal;
+}): Promise<{
+  base64: string;
+  mimeType: string;
+  usedModelId: string;
+  latencyMs: number;
+  tokens: number;
+}> {
+  const { requestedModelId, temperature, prompt, sessionKeys, signal } = params;
+  const cred = resolveEffectiveStepCredential(
+    'gemini',
+    requestedModelId,
+    'image_generation',
+    process.env,
+    sessionKeys
+  );
+  const candidates = buildGeminiImageCandidateModels(requestedModelId);
+  let lastError = 'Upstream Flash image model failed.';
+
+  for (const candidateModel of candidates) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (signal?.aborted) throw new Error('Run cancelled by user.');
+      const started = Date.now();
+      const reqSpec = buildImageStepHttpRequest({
+        modelId: candidateModel,
+        apiKey: cred.apiKey,
+        prompt,
+        temperature,
+      });
+
+      const resp = await fetch(reqSpec.url, {
+        method: 'POST',
+        headers: reqSpec.headers,
+        body: reqSpec.body,
+        signal,
+      });
+      const elapsed = Date.now() - started;
+      const payload = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+
+      if (resp.ok) {
+        const extracted = extractImageStepOutput('gemini', payload);
+        if (extracted?.base64) {
+          return {
+            base64: extracted.base64,
+            mimeType: extracted.mimeType,
+            usedModelId: candidateModel,
+            latencyMs: elapsed,
+            tokens: extracted.totalTokens,
+          };
+        }
+      }
+
+      const errObj = (payload.error ?? {}) as Record<string, unknown>;
+      lastError = String(errObj.message ?? `HTTP ${resp.status} from ${candidateModel}`);
+      if (isQuotaOrRateLimitError(resp.status, lastError)) {
+        await sleepMs(1400 * (attempt + 1), signal);
+        if (attempt === 0) continue;
+        break;
+      }
+      break;
+    }
+  }
+
+  throw new HttpStatusError(502, `Image step failed on $0.034 Flash cascade: ${lastError}`);
+}
+
+async function persistGeneratedSceneMedia(
+  admin: SupabaseClient,
+  runId: string,
+  base64: string,
+  mimeType: string
+): Promise<string> {
+  const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
+  const objectPath = `hanzi-mnemonic/${runId}.${ext}`;
+  try {
+    const bytes = Buffer.from(base64, 'base64');
+    const up = await admin.storage.from('chain-media').upload(objectPath, bytes, {
+      contentType: mimeType,
+      upsert: true,
+    });
+    if (!up.error) {
+      const pub = admin.storage.from('chain-media').getPublicUrl(objectPath);
+      if (pub?.data?.publicUrl) {
+        return pub.data.publicUrl;
+      }
+    }
+  } catch {
+    // Fall back to inline data URL when storage bucket is unavailable in local preview.
+  }
+  return `data:${mimeType};base64,${base64}`;
+}
+
+export async function* executeHanziChainRunGenerator(params: {
   admin: SupabaseClient;
   user: { id: string; email: string };
   chainId: string;
-  body: Record<string, unknown>;
-}): Promise<PromptChainRunRow> {
-  const { admin, user, chainId, body } = params;
+  hanziInput: string;
+  textOnlyPreview: boolean;
+  sessionKeys?: SessionKeyOverrides;
+  signal?: AbortSignal;
+}): AsyncGenerator<SseRunEvent> {
+  const { admin, user, chainId, hanziInput, textOnlyPreview, sessionKeys, signal } = params;
+
   if (!CHAIN_UUID_PATTERN.test(chainId)) {
-    throw new Error('Invalid chain ID.');
+    throw new HttpStatusError(400, 'Invalid chain ID.');
   }
 
-  const [{ data: chainRow, error: chainErr }, { data: stepRows, error: stepsErr }, providersRes, modelsRes] =
-    await Promise.all([
-      admin.from('prompt_chains').select('*').eq('id', chainId).maybeSingle(),
-      admin
-        .from('prompt_chain_steps')
-        .select('*')
-        .eq('chain_id', chainId)
-        .order('step_order', { ascending: true }),
-      admin.from('llm_providers').select('*'),
-      admin.from('arena_models').select('*').is('canonical_id', null),
-    ]);
-
-  if (chainErr) throw new Error(chainErr.message);
-  if (!chainRow) throw new Error('Prompt chain not found.');
-  if (stepsErr) throw new Error(stepsErr.message);
-
-  const chain = chainRow as PromptChainRow;
-  const steps = ((stepRows ?? []) as PromptChainStepRow[])
-    .slice()
-    .sort((a, b) => a.step_order - b.step_order);
-
-  if (steps.length === 0) {
-    throw new Error('Add at least one step to this prompt chain before running it.');
-  }
-
-  if (process.env.GENERATION_ENABLED === 'false') {
-    throw new Error('Live LLM execution is currently paused (GENERATION_ENABLED=false).');
-  }
-
-  const requestedModelKey = typeof body.modelKey === 'string' ? body.modelKey : null;
-  const selectedModel = resolveSelectedChainModel({
-    requestedKey: requestedModelKey,
-    providers: (providersRes.error ? [] : (providersRes.data ?? [])) as CatalogProviderRow[],
-    models: (modelsRes.error ? [] : (modelsRes.data ?? [])) as CatalogModelRow[],
-    env: process.env,
-  });
-
-  const rawSourceType = typeof body.sourceType === 'string' ? body.sourceType.trim() : 'sample_svg';
-  const premise = typeof body.premise === 'string' ? body.premise.trim().slice(0, 800) : '';
-
-  let sourceType: InputSourceType = 'sample_svg';
-  let inputSceneId: string | null = null;
-  let inputSceneTitle: string | null = null;
-  let persistedImageUrl: string | null = null;
-  let visionImage: VisionImagePayload | null = null;
-  let inputContext = premise;
-
-  if (rawSourceType === 'sample_svg') {
-    sourceType = 'sample_svg';
-    const rawSceneId = typeof body.sceneId === 'string' ? body.sceneId : 'scene-stack-trace';
-    const scene = getSampleSceneById(rawSceneId);
-    if (!scene) {
-      throw new Error(`Unknown built-in sample scene "${rawSceneId}".`);
-    }
-    inputSceneId = scene.id;
-    inputSceneTitle = scene.title;
-
-    if (typeof body.visionImageDataUrl === 'string' && body.visionImageDataUrl.trim()) {
-      const parsedPng = parseBoundedImageDataUrl(body.visionImageDataUrl);
-      visionImage = { mimeType: parsedPng.mimeType, base64Data: parsedPng.base64Data };
-      inputContext = [
-        `Scene Title: ${scene.title}`,
-        premise ? `User Direction / Premise: ${premise}` : `Premise: ${scene.defaultPremise}`,
-      ].join('\n');
-    } else {
-      // Headless API callers without a browser <canvas> still succeed cleanly via the canonical visual blueprint
-      inputContext = [
-        `Scene Title: ${scene.title}`,
-        `Visual Scene Details: ${scene.visualBlueprint}`,
-        premise ? `User Direction / Premise: ${premise}` : `Premise: ${scene.defaultPremise}`,
-      ].join('\n');
-    }
-  } else if (rawSourceType === 'upload') {
-    sourceType = 'upload';
-    if (typeof body.imageDataUrl !== 'string' || !body.imageDataUrl.trim()) {
-      throw new Error('Select a PNG, JPEG, WebP, or GIF image to upload.');
-    }
-    const parsedUpload = parseBoundedImageDataUrl(body.imageDataUrl);
-    visionImage = { mimeType: parsedUpload.mimeType, base64Data: parsedUpload.base64Data };
-    persistedImageUrl = parsedUpload.dataUrl;
-    const uploadName =
-      typeof body.uploadFileName === 'string' && body.uploadFileName.trim()
-        ? body.uploadFileName.trim().slice(0, 120)
-        : 'Uploaded Image';
-    inputSceneTitle = uploadName;
-  } else if (rawSourceType === 'image_url') {
-    sourceType = 'image_url';
-    if (typeof body.imageUrl !== 'string' || !body.imageUrl.trim()) {
-      throw new Error('Enter an https:// image URL to analyze.');
-    }
-    const fetched = await fetchExternalVisionImage(body.imageUrl);
-    visionImage = fetched.image;
-    persistedImageUrl = fetched.canonicalUrl;
-    inputSceneTitle = 'External Image URL';
-  } else {
-    throw new Error('Invalid input source type.');
-  }
-
-  const runRequestUuid = randomUUID();
-  const { data: insertedRun, error: insertRunErr } = await admin
-    .from('prompt_chain_runs')
-    .insert({
-      chain_id: chain.id,
-      chain_slug: chain.slug,
-      chain_name: chain.name,
-      user_id: user.id,
-      user_email: user.email,
-      provider: selectedModel.providerSlug,
-      model: selectedModel.apiModel,
-      input_source_type: sourceType,
-      input_scene_id: inputSceneId,
-      input_scene_title: inputSceneTitle,
-      input_image_url: persistedImageUrl,
-      input_premise: premise,
-      step_outputs: [],
-      final_captions: [],
-      status: 'running',
-      total_latency_ms: 0,
-      total_tokens: 0,
-    })
+  const { data: rawChain, error: chainErr } = await admin
+    .from('prompt_chains')
     .select('*')
-    .single();
+    .eq('id', chainId)
+    .eq('app_scope', HANZI_APP_SCOPE)
+    .maybeSingle();
 
-  if (insertRunErr || !insertedRun) {
-    throw new Error(insertRunErr?.message ?? 'Could not initialize prompt chain run record.');
+  if (chainErr || !rawChain) {
+    throw new HttpStatusError(404, 'Prompt chain not found.');
+  }
+  const chain = hydrateChainRow(rawChain as Record<string, unknown>);
+
+  // Deterministic pre-chain dataset lookup & non-inventing Fit Check ($0.00 before any LLM call!)
+  const lookup = lookupHanziTarget(hanziInput, chain.decomposition_mode);
+  if (lookup.status === 'invalid') {
+    throw new HttpStatusError(400, lookup.mismatch_reason || 'Enter 1 to 4 Simplified Chinese characters.');
+  }
+  if (lookup.status === 'fit_mismatch' || lookup.status === 'base_pictograph') {
+    yield { type: 'fit_mismatch', lookup };
+    return;
   }
 
-  const runId = String((insertedRun as { id: string }).id);
-  const stepTraces: StepExecutionTrace[] = [];
-  const upstreamOutputs: string[] = [];
+  yield { type: 'lookup_complete', lookup };
+
+  const { data: rawSteps, error: stepsErr } = await admin
+    .from('prompt_chain_steps')
+    .select('*')
+    .eq('chain_id', chain.id)
+    .order('step_order', { ascending: true });
+
+  if (stepsErr || !rawSteps || rawSteps.length === 0) {
+    throw new HttpStatusError(400, 'This chain has no steps configured.');
+  }
+  const steps = rawSteps.map((s) => hydrateStepRow(s as Record<string, unknown>));
+
+  const budgetBefore = await fetchDailyImageBudget(admin);
+  const dailyCapReached = !textOnlyPreview && budgetBefore.remaining <= 0;
+  const effectiveTextOnly = textOnlyPreview || dailyCapReached;
+
+  const traces: StepExecutionTrace[] = [];
   let totalLatencyMs = 0;
   let totalTokens = 0;
+  let generatedMediaUrl: string | null = null;
+  let generatedMediaMime = 'image/jpeg';
+  let generatedMediaPrompt: string | null = null;
+  const runId = randomUUID();
 
-  try {
-    for (let idx = 0; idx < steps.length; idx++) {
-      const step = steps[idx];
-      const stepNumber = idx + 1;
-      const isFinalStep = stepNumber === steps.length;
+  for (const step of steps) {
+    if (signal?.aborted) throw new Error('Run cancelled by user.');
 
-      const compiledPrompt = compileStepInstruction({
-        personaStyle: chain.persona_style,
-        stepOrder: stepNumber,
-        totalSteps: steps.length,
-        stepName: step.step_name,
-        stepRole: step.step_role,
-        instructionTemplate: step.instruction_template,
-        inputContext,
-        upstreamOutputs,
+    if (step.step_modality === 'image_generation') {
+      if (effectiveTextOnly) {
+        continue;
+      }
+      const lastText =
+        [...traces].reverse().find((t) => t.step_modality === 'text')?.output_text ?? '';
+      const { imagePrompt } = compileCardFromTextTraces({
+        lookup,
+        rawStepText: lastText,
+        textOnlyPreview: false,
       });
 
-      const stepRes = await executeSingleChainStepLlm({
-        model: selectedModel,
-        prompt: compiledPrompt,
-        image: idx === 0 || step.step_role === 'vision_analysis' ? visionImage : null,
-        expectFiveCaptionsJson: isFinalStep,
+      yield {
+        type: 'step_started',
+        step_order: step.step_order,
+        total_steps: steps.length,
+        step_name: step.step_name,
+        step_role: step.step_role,
+        model_id: step.model_id,
+        temperature: step.temperature,
+        step_modality: 'image_generation',
+      };
+
+      const imgRes = await invokeImageStepWithCascade({
+        requestedModelId: step.model_id,
+        temperature: step.temperature,
+        prompt: imagePrompt,
+        sessionKeys,
+        signal,
       });
 
-      totalLatencyMs += stepRes.latencyMs;
-      totalTokens += (stepRes.inputTokens ?? 0) + (stepRes.outputTokens ?? 0);
-      upstreamOutputs.push(stepRes.outputText);
+      generatedMediaUrl = await persistGeneratedSceneMedia(
+        admin,
+        runId,
+        imgRes.base64,
+        imgRes.mimeType
+      );
+      generatedMediaMime = imgRes.mimeType;
+      generatedMediaPrompt = imagePrompt;
 
-      stepTraces.push({
-        step_order: stepNumber,
-        step_id: step.id,
+      const imgTrace: StepExecutionTrace = {
+        step_order: step.step_order,
         step_name: step.step_name,
         step_role: step.step_role,
         output_field: step.output_field,
-        compiled_prompt: compiledPrompt.slice(0, 4000),
-        output_text: stepRes.outputText.slice(0, 4000),
-        latency_ms: stepRes.latencyMs,
-        input_tokens: stepRes.inputTokens,
-        output_tokens: stepRes.outputTokens,
-      });
+        provider: 'gemini',
+        model_id: imgRes.usedModelId,
+        temperature: step.temperature,
+        step_modality: 'image_generation',
+        compiled_prompt: imagePrompt,
+        output_text: `Rendered 1:1 zero-text mnemonic scene via ${imgRes.usedModelId} (${imgRes.mimeType}).`,
+        latency_ms: imgRes.latencyMs,
+        tokens: imgRes.tokens,
+      };
+      traces.push(imgTrace);
+      totalLatencyMs += imgRes.latencyMs;
+      totalTokens += imgRes.tokens;
 
-      // Best-effort per-step observability trace in shared public.llm_responses
-      try {
-        await admin.from('llm_responses').insert({
-          request_id: runRequestUuid,
-          provider: selectedModel.providerSlug,
-          model: stepRes.resolvedModel,
-          prompt_chain_name: `${chain.name} [Step ${stepNumber}/${steps.length}: ${step.step_name}]`,
-          prompt_text: compiledPrompt.slice(0, 4000),
-          raw_response_text: stepRes.outputText.slice(0, 4000),
-          status: 'success',
-          http_status: stepRes.httpStatus,
-          latency_ms: stepRes.latencyMs,
-          input_tokens: stepRes.inputTokens,
-          output_tokens: stepRes.outputTokens,
-          reasoning_tokens: stepRes.reasoningTokens,
-          provider_request_id: stepRes.providerRequestId,
-          usage: stepRes.usage,
-        });
-      } catch {
-        // Non-blocking telemetry write
-      }
+      yield {
+        type: 'step_completed',
+        trace: imgTrace,
+        total_steps: steps.length,
+      };
+      continue;
     }
 
-    const finalOutputText = upstreamOutputs[upstreamOutputs.length - 1] ?? '';
-    const finalCaptions = parseFiveCaptions(finalOutputText);
+    const compiledPrompt = compileMnemonicStepInstruction({
+      template: step.instruction_template,
+      lookup,
+      chainName: chain.name,
+      personaStyle: chain.persona_style,
+      priorOutputs: traces,
+    });
 
-    const { data: completedRow, error: completeErr } = await admin
-      .from('prompt_chain_runs')
-      .update({
-        step_outputs: stepTraces,
-        final_captions: finalCaptions,
-        status: 'completed',
-        error_message: null,
-        total_latency_ms: totalLatencyMs,
-        total_tokens: totalTokens,
-      })
-      .eq('id', runId)
-      .select('*')
-      .single();
+    yield {
+      type: 'step_started',
+      step_order: step.step_order,
+      total_steps: steps.length,
+      step_name: step.step_name,
+      step_role: step.step_role,
+      model_id: step.model_id,
+      temperature: step.temperature,
+      step_modality: 'text',
+    };
 
-    if (completeErr || !completedRow) {
-      throw new Error(completeErr?.message ?? 'Failed to persist completed chain run.');
-    }
+    const textRes = await invokeTextStepWithCascade({
+      step,
+      prompt: compiledPrompt,
+      sessionKeys,
+      signal,
+    });
 
-    return normalizeRunRow(completedRow as Record<string, unknown>);
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : 'Prompt chain execution failed.';
-    await admin
-      .from('prompt_chain_runs')
-      .update({
-        step_outputs: stepTraces,
-        status: 'failed',
-        error_message: errMsg.slice(0, 500),
-        total_latency_ms: totalLatencyMs,
-        total_tokens: totalTokens,
-      })
-      .eq('id', runId);
-    throw err;
+    const textTrace: StepExecutionTrace = {
+      step_order: step.step_order,
+      step_name: step.step_name,
+      step_role: step.step_role,
+      output_field: step.output_field,
+      provider: 'gemini',
+      model_id: textRes.usedModelId,
+      temperature: step.temperature,
+      step_modality: 'text',
+      compiled_prompt: compiledPrompt,
+      output_text: textRes.text,
+      latency_ms: textRes.latencyMs,
+      tokens: textRes.tokens,
+    };
+    traces.push(textTrace);
+    totalLatencyMs += textRes.latencyMs;
+    totalTokens += textRes.tokens;
+
+    yield {
+      type: 'step_completed',
+      trace: textTrace,
+      total_steps: steps.length,
+    };
   }
+
+  const finalTextTrace =
+    [...traces].reverse().find((t) => t.step_modality === 'text')?.output_text ?? '';
+  const { card, imagePrompt } = compileCardFromTextTraces({
+    lookup,
+    rawStepText: finalTextTrace,
+    textOnlyPreview: !generatedMediaUrl,
+    dailyCapReached,
+  });
+
+  const insertPayload = {
+    id: runId,
+    chain_id: chain.id,
+    chain_slug: chain.slug,
+    chain_name: chain.name,
+    user_id: CHAIN_UUID_PATTERN.test(user.id) ? user.id : null,
+    user_email: user.email,
+    provider: 'gemini',
+    model: traces[traces.length - 1]?.model_id ?? 'gemini-3.5-flash-lite',
+    input_source_type: 'text_only',
+    input_premise: lookup.input,
+    input_tags: [lookup.effective_mode, ...(effectiveTextOnly ? ['text_preview'] : ['full_card'])],
+    step_outputs: traces,
+    final_captions: [card.mnemonic_hook],
+    generated_media_url: generatedMediaUrl,
+    generated_media_mime: generatedMediaMime,
+    generated_media_prompt: generatedMediaPrompt ?? imagePrompt,
+    structured_card: card,
+    status: 'completed',
+    error_message: null,
+    total_latency_ms: totalLatencyMs,
+    total_tokens: totalTokens,
+    app_scope: HANZI_APP_SCOPE,
+  };
+
+  const { data: inserted, error: insErr } = await admin
+    .from('prompt_chain_runs')
+    .insert(insertPayload)
+    .select('*')
+    .single();
+
+  if (insErr || !inserted) {
+    throw new HttpStatusError(500, `Failed to save mnemonic card run: ${insErr?.message ?? 'unknown'}`);
+  }
+
+  const hydratedRun = hydrateRunRow(inserted as Record<string, unknown>);
+  const updatedBudget = await fetchDailyImageBudget(admin);
+  yield {
+    type: 'run_completed',
+    run: hydratedRun,
+    imageBudget: updatedBudget,
+  };
+}
+
+export async function renderSceneForPreviewRun(params: {
+  admin: SupabaseClient;
+  runId: string;
+  sessionKeys?: SessionKeyOverrides;
+}): Promise<{ run: PromptChainRunRow; imageBudget: DailyImageBudget }> {
+  const { admin, runId, sessionKeys } = params;
+  if (!CHAIN_UUID_PATTERN.test(runId)) {
+    throw new HttpStatusError(400, 'Invalid run ID.');
+  }
+
+  const { data: rawRun, error: runErr } = await admin
+    .from('prompt_chain_runs')
+    .select('*')
+    .eq('id', runId)
+    .eq('app_scope', HANZI_APP_SCOPE)
+    .maybeSingle();
+
+  if (runErr || !rawRun) {
+    throw new HttpStatusError(404, 'Saved text-preview card not found.');
+  }
+
+  const existing = hydrateRunRow(rawRun as Record<string, unknown>);
+  if (existing.generated_media_url) {
+    return {
+      run: existing,
+      imageBudget: await fetchDailyImageBudget(admin),
+    };
+  }
+
+  const budget = await fetchDailyImageBudget(admin);
+  if (budget.remaining <= 0) {
+    throw new HttpStatusError(
+      429,
+      `Daily image cap (${budget.dailyCap}/${budget.dailyCap}) reached since 00:00 UTC.`
+    );
+  }
+
+  const prompt =
+    existing.generated_media_prompt?.trim() || existing.structured_card.image_prompt;
+
+  // Check if the chain has an image step to respect its selected model & temperature
+  const { data: chainSteps } = await admin
+    .from('prompt_chain_steps')
+    .select('*')
+    .eq('chain_id', existing.chain_id)
+    .order('step_order', { ascending: true });
+
+  const imgStep = (chainSteps ?? [])
+    .map((s) => hydrateStepRow(s as Record<string, unknown>))
+    .find((s) => s.step_modality === 'image_generation');
+
+  const requestedModel = imgStep?.model_id ?? 'gemini-3.1-flash-lite-image';
+  const temp = imgStep?.temperature ?? 0.6;
+
+  const imgRes = await invokeImageStepWithCascade({
+    requestedModelId: requestedModel,
+    temperature: temp,
+    prompt,
+    sessionKeys,
+  });
+
+  const mediaUrl = await persistGeneratedSceneMedia(
+    admin,
+    existing.id,
+    imgRes.base64,
+    imgRes.mimeType
+  );
+
+  const nextStepOrder = imgStep?.step_order ?? existing.step_outputs.length + 1;
+  const imgTrace: StepExecutionTrace = {
+    step_order: nextStepOrder,
+    step_name: imgStep?.step_name ?? '1:1 Mnemonic Scene Picture',
+    step_role: imgStep?.step_role ?? 'picture',
+    output_field: imgStep?.output_field ?? 'generated_scene_media',
+    provider: 'gemini',
+    model_id: imgRes.usedModelId,
+    temperature: temp,
+    step_modality: 'image_generation',
+    compiled_prompt: prompt,
+    output_text: `Rendered 1:1 zero-text mnemonic scene via ${imgRes.usedModelId} (${imgRes.mimeType}).`,
+    latency_ms: imgRes.latencyMs,
+    tokens: imgRes.tokens,
+  };
+
+  const updatedTraces = [
+    ...existing.step_outputs.filter((t) => t.step_modality !== 'image_generation'),
+    imgTrace,
+  ];
+  const updatedCard = {
+    ...existing.structured_card,
+    text_only_preview: false,
+    daily_cap_reached: false,
+  };
+
+  const { data: updatedRaw, error: updErr } = await admin
+    .from('prompt_chain_runs')
+    .update({
+      model: imgRes.usedModelId,
+      step_outputs: updatedTraces,
+      generated_media_url: mediaUrl,
+      generated_media_mime: imgRes.mimeType,
+      generated_media_prompt: prompt,
+      structured_card: updatedCard,
+      total_latency_ms: existing.total_latency_ms + imgRes.latencyMs,
+      total_tokens: existing.total_tokens + imgRes.tokens,
+    })
+    .eq('id', existing.id)
+    .eq('app_scope', HANZI_APP_SCOPE)
+    .select('*')
+    .single();
+
+  if (updErr || !updatedRaw) {
+    throw new HttpStatusError(500, `Failed to update rendered card: ${updErr?.message ?? 'unknown'}`);
+  }
+
+  return {
+    run: hydrateRunRow(updatedRaw as Record<string, unknown>),
+    imageBudget: await fetchDailyImageBudget(admin),
+  };
 }

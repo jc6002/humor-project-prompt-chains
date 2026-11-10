@@ -1,19 +1,19 @@
 {
-  "name": "humor-project-prompt-chains",
+  "name": "hanzi-mnemonic-deck",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3002",
-    "build": "next build",
-    "start": "next start -p 3002",
+    "dev": "next dev -p 3005",
+    "build": "next build --webpack",
+    "start": "next start -p 3005",
     "lint": "eslint",
     "test": "node --test tests/*.test.mjs",
-    "test:db": "node tests/prompt-chains-db.mjs"
+    "test:db": "node tests/mnemonic-db.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.116.0",
-    "next": "^16.4.4",
+    "next": "16.4.4",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
@@ -24,7 +24,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "^16.4.4",
+    "eslint-config-next": "16.4.4",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

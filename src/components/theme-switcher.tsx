@@ -1,111 +1,78 @@
 'use client';
-import { useSyncExternalStore } from 'react';
 
-export type ThemePreference = 'light' | 'dark' | 'system';
+import { useEffect, useState } from 'react';
 
-const STORAGE_KEY = 'prompt-chain-studio-theme';
-const listeners = new Set<() => void>();
+type ThemePref = 'light' | 'dark' | 'system';
 
-function resolveTheme(pref: ThemePreference): 'light' | 'dark' {
-  if (pref === 'light') return 'light';
-  if (pref === 'dark') return 'dark';
-  if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-    return 'dark';
-  }
-  return 'light';
-}
+const STORAGE_KEY = 'hanzi-parts-studio-theme';
 
-function applyDocumentTheme(pref: ThemePreference) {
-  if (typeof document === 'undefined') return;
-  const resolved = resolveTheme(pref);
+function applyTheme(pref: ThemePref): void {
+  if (typeof window === 'undefined') return;
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const resolved = pref === 'dark' || (pref === 'system' && prefersDark) ? 'dark' : 'light';
   document.documentElement.dataset.theme = resolved;
   document.documentElement.dataset.themePref = pref;
   document.documentElement.style.colorScheme = resolved;
 }
 
-function getClientSnapshot(): ThemePreference {
-  if (typeof window === 'undefined') return 'system';
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw === 'light' || raw === 'dark' || raw === 'system') {
-      return raw;
-    }
-  } catch {
-    // Ignore restricted storage environments
-  }
-  return 'system';
-}
-
-function getServerSnapshot(): ThemePreference {
-  return 'system';
-}
-
-function subscribe(callback: () => void): () => void {
-  listeners.add(callback);
-  if (typeof window === 'undefined') {
-    return () => listeners.delete(callback);
-  }
-
-  const mql = window.matchMedia('(prefers-color-scheme: dark)');
-  const handleMedia = () => {
-    const current = getClientSnapshot();
-    if (current === 'system') {
-      applyDocumentTheme('system');
-      callback();
-    }
-  };
-  const handleStorage = (e: StorageEvent) => {
-    if (e.key === STORAGE_KEY) {
-      applyDocumentTheme(getClientSnapshot());
-      callback();
-    }
-  };
-
-  mql.addEventListener('change', handleMedia);
-  window.addEventListener('storage', handleStorage);
-  return () => {
-    listeners.delete(callback);
-    mql.removeEventListener('change', handleMedia);
-    window.removeEventListener('storage', handleStorage);
-  };
-}
-
-export function setThemePreference(nextPref: ThemePreference) {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, nextPref);
-  } catch {
-    // Ignore storage write errors
-  }
-  applyDocumentTheme(nextPref);
-  for (const listener of listeners) {
-    listener();
-  }
-}
-
-const SEGMENTS: ReadonlyArray<{ value: ThemePreference; icon: string; label: string }> = [
-  { value: 'light', icon: '☀', label: 'Light' },
-  { value: 'dark', icon: '☾', label: 'Dark' },
-  { value: 'system', icon: '◐', label: 'System' },
-];
-
 export function ThemeSwitcher() {
-  const pref = useSyncExternalStore(subscribe, getClientSnapshot, getServerSnapshot);
+  const [pref, setPref] = useState<ThemePref>(() => {
+    if (typeof window === 'undefined') return 'system';
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved === 'light' || saved === 'dark' ? saved : 'system';
+  });
+
+  useEffect(() => {
+    applyTheme(pref);
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => {
+      const latest = (localStorage.getItem(STORAGE_KEY) as ThemePref | null) ?? 'system';
+      if (latest === 'system') applyTheme('system');
+    };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [pref]);
+
+  const choose = (next: ThemePref) => {
+    setPref(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      // Ignore storage quota errors in restricted browsers.
+    }
+    applyTheme(next);
+  };
+
+  const options: ReadonlyArray<{ value: ThemePref; label: string }> = [
+    { value: 'light', label: '☀ Light' },
+    { value: 'dark', label: '☾ Dark' },
+    { value: 'system', label: '◐ System' },
+  ];
 
   return (
-    <div className="theme-switcher" role="radiogroup" aria-label="Color theme">
-      {SEGMENTS.map((seg) => {
-        const active = pref === seg.value;
+    <div className="theme-segment" role="radiogroup" aria-label="Color theme">
+      {options.map((opt, idx) => {
+        const active = pref === opt.value;
         return (
           <button
-            key={seg.value}
+            key={opt.value}
             type="button"
             role="radio"
             aria-checked={active}
-            className={`theme-segment ${active ? 'active' : ''}`}
-            onClick={() => setThemePreference(seg.value)}
+            tabIndex={active ? 0 : -1}
+            className={`theme-btn ${active ? 'active' : ''}`}
+            onClick={() => choose(opt.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+                e.preventDefault();
+                choose(options[(idx + 1) % options.length].value);
+              } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                choose(options[(idx - 1 + options.length) % options.length].value);
+              }
+            }}
           >
-            <span aria-hidden="true">{seg.icon}</span>
-            <span>{seg.label}</span>
+            {opt.label}
           </button>
         );
       })}

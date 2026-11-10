@@ -1,41 +1,71 @@
+import { DEFAULT_STARTER_STEPS, HANZI_APP_SCOPE } from '@/lib/chains/presets';
 import {
   apiFailure,
   fetchStudioInitialData,
   requireSuperadminApi,
 } from '@/lib/chains/server';
-import { validateChainInput } from '@/lib/chains/validation';
+import {
+  slugifyChainName,
+  validateChainInput,
+} from '@/lib/chains/validation';
 
 export async function GET(request: Request) {
   try {
-    await requireSuperadminApi(request, { requireJson: false });
-    const data = await fetchStudioInitialData();
-    return Response.json(data, { headers: { 'Cache-Control': 'no-store' } });
-  } catch (err) {
-    return apiFailure(err);
+    const { admin } = await requireSuperadminApi(request, { methodIsMutating: false });
+    const data = await fetchStudioInitialData(admin);
+    return Response.json(data, { status: 200, headers: { 'Cache-Control': 'no-store' } });
+  } catch (error) {
+    return apiFailure(error);
   }
 }
 
 export async function POST(request: Request) {
   try {
     const { admin } = await requireSuperadminApi(request);
-    const body = (await request.json()) as Record<string, unknown>;
-    const payload = validateChainInput(body, false);
+    const body = await request.json();
+    const validated = validateChainInput(body, { isUpdate: false });
+    const slug = slugifyChainName(validated.name);
 
-    const { data, error } = await admin
+    const { data: chain, error: chainErr } = await admin
       .from('prompt_chains')
-      .insert(payload)
+      .insert({
+        slug,
+        name: validated.name,
+        description: validated.description,
+        persona_style: validated.persona_style,
+        decomposition_mode: validated.decomposition_mode,
+        is_active: validated.is_active,
+        mix_weight: 0,
+        app_scope: HANZI_APP_SCOPE,
+      })
       .select('*')
       .single();
 
-    if (error) {
-      if (error.code === '23505') {
-        throw new Error(`A prompt chain with slug "${String(payload.slug)}" already exists.`);
-      }
-      throw new Error(error.message);
+    if (chainErr || !chain) {
+      throw new Error(chainErr?.message ?? 'Failed to create prompt chain.');
     }
 
-    return Response.json({ chain: data }, { status: 201, headers: { 'Cache-Control': 'no-store' } });
-  } catch (err) {
-    return apiFailure(err);
+    const starterRows = DEFAULT_STARTER_STEPS.map((st, idx) => ({
+      chain_id: chain.id,
+      step_order: idx + 1,
+      ...st,
+    }));
+
+    const { data: steps, error: stepsErr } = await admin
+      .from('prompt_chain_steps')
+      .insert(starterRows)
+      .select('*')
+      .order('step_order', { ascending: true });
+
+    if (stepsErr) {
+      throw new Error(stepsErr.message);
+    }
+
+    return Response.json(
+      { chain, steps: steps ?? [] },
+      { status: 201, headers: { 'Cache-Control': 'no-store' } }
+    );
+  } catch (error) {
+    return apiFailure(error);
   }
 }

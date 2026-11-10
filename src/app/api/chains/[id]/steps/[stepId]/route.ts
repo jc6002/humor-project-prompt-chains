@@ -1,95 +1,101 @@
-import {
-  apiFailure,
-  reorderChainStepsAtomically,
-  requireSuperadminApi,
-} from '@/lib/chains/server';
+import { HANZI_APP_SCOPE } from '@/lib/chains/presets';
+import { apiFailure, HttpStatusError, requireSuperadminApi } from '@/lib/chains/server';
 import { CHAIN_UUID_PATTERN, validateStepInput } from '@/lib/chains/validation';
 
-type RouteContext = { params: Promise<{ id: string; stepId: string }> };
+type RouteCtx = { params: Promise<{ id: string; stepId: string }> };
 
-export async function PATCH(request: Request, context: RouteContext) {
+export async function PATCH(request: Request, context: RouteCtx) {
   try {
+    const { admin } = await requireSuperadminApi(request);
     const { id: chainId, stepId } = await context.params;
     if (!CHAIN_UUID_PATTERN.test(chainId) || !CHAIN_UUID_PATTERN.test(stepId)) {
-      throw new Error('Invalid chain or step ID.');
-    }
-    const { admin } = await requireSuperadminApi(request);
-    const body = (await request.json()) as Record<string, unknown>;
-    const updates = validateStepInput(body, true);
-    if (Object.keys(updates).length === 0) {
-      throw new Error('No step fields supplied to update.');
+      throw new HttpStatusError(400, 'Invalid chain or step ID.');
     }
 
-    const { data, error } = await admin
-      .from('prompt_chain_steps')
-      .update(updates)
-      .eq('chain_id', chainId)
-      .eq('id', stepId)
-      .select('*')
+    const { data: chain } = await admin
+      .from('prompt_chains')
+      .select('id')
+      .eq('id', chainId)
+      .eq('app_scope', HANZI_APP_SCOPE)
       .maybeSingle();
 
-    if (error) {
-      throw new Error(error.message);
-    }
-    if (!data) {
-      throw new Error('Prompt chain step not found.');
+    if (!chain) {
+      throw new HttpStatusError(404, 'Prompt chain not found.');
     }
 
-    await admin
-      .from('prompt_chains')
-      .update({ updated_at: new Date().toISOString() })
-      .eq('id', chainId);
+    const validated = validateStepInput(await request.json());
+    const { data: updated, error } = await admin
+      .from('prompt_chain_steps')
+      .update(validated)
+      .eq('id', stepId)
+      .eq('chain_id', chainId)
+      .select('*')
+      .single();
 
-    return Response.json({ step: data }, { headers: { 'Cache-Control': 'no-store' } });
-  } catch (err) {
-    return apiFailure(err);
+    if (error || !updated) {
+      throw new HttpStatusError(404, error?.message ?? 'Chain step not found.');
+    }
+
+    return Response.json({ step: updated }, { status: 200, headers: { 'Cache-Control': 'no-store' } });
+  } catch (error) {
+    return apiFailure(error);
   }
 }
 
-export async function DELETE(request: Request, context: RouteContext) {
+export async function DELETE(request: Request, context: RouteCtx) {
   try {
+    const { admin } = await requireSuperadminApi(request, { requireJson: false });
     const { id: chainId, stepId } = await context.params;
     if (!CHAIN_UUID_PATTERN.test(chainId) || !CHAIN_UUID_PATTERN.test(stepId)) {
-      throw new Error('Invalid chain or step ID.');
-    }
-    const { admin } = await requireSuperadminApi(request, { requireJson: false });
-
-    const { error } = await admin
-      .from('prompt_chain_steps')
-      .delete()
-      .eq('chain_id', chainId)
-      .eq('id', stepId);
-    if (error) {
-      throw new Error(error.message);
+      throw new HttpStatusError(400, 'Invalid chain or step ID.');
     }
 
-    const { data: remainingRows, error: remErr } = await admin
+    const { data: chain } = await admin
+      .from('prompt_chains')
+      .select('id')
+      .eq('id', chainId)
+      .eq('app_scope', HANZI_APP_SCOPE)
+      .maybeSingle();
+
+    if (!chain) {
+      throw new HttpStatusError(404, 'Prompt chain not found.');
+    }
+
+    const { data: allSteps } = await admin
       .from('prompt_chain_steps')
-      .select('id, step_order')
+      .select('id')
       .eq('chain_id', chainId)
       .order('step_order', { ascending: true });
-    if (remErr) {
-      throw new Error(remErr.message);
+
+    if (!allSteps || allSteps.length <= 1) {
+      throw new HttpStatusError(400, 'A prompt chain must retain at least one step.');
     }
 
-    const remainingIds = (remainingRows ?? []).map((r: { id: string }) => r.id);
-    const compacted =
-      remainingIds.length > 0
-        ? await reorderChainStepsAtomically(admin, chainId, remainingIds)
-        : [];
+    const { error: delErr } = await admin
+      .from('prompt_chain_steps')
+      .delete()
+      .eq('id', stepId)
+      .eq('chain_id', chainId);
 
-    if (remainingIds.length === 0) {
-      await admin
-        .from('prompt_chains')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', chainId);
+    if (delErr) {
+      throw new Error(delErr.message);
+    }
+
+    const remainingIds = allSteps.filter((s) => s.id !== stepId).map((s) => s.id);
+    const { data: reordered, error: rpcErr } = await admin.rpc('reorder_prompt_chain_steps', {
+      p_chain_id: chainId,
+      p_step_ids: remainingIds,
+    });
+
+    if (rpcErr) {
+      throw new Error(rpcErr.message);
     }
 
     return Response.json(
-      { deletedId: stepId, steps: compacted },
-      { headers: { 'Cache-Control': 'no-store' } }
+      { deleted: true, steps: reordered ?? [] },
+      { status: 200, headers: { 'Cache-Control': 'no-store' } }
     );
-  } catch (err) {
-    return apiFailure(err);
+  } catch (error) {
+    return apiFailure(error);
   }
 }

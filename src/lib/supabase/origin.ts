@@ -30,11 +30,7 @@ function isLoopbackHostname(hostname: string): boolean {
   return clean === 'localhost' || clean === '127.0.0.1' || clean === '[::1]' || clean === '::1';
 }
 
-/**
- * Resolves a canonical origin without ever trusting spoofable x-forwarded-host
- * or x-forwarded-proto request headers. Pins http: on loopback and https: on
- * non-loopback hosts when NEXT_PUBLIC_SITE_URL is unset.
- */
+// Resolves a safe origin without trusting spoofable forwarded headers.
 export function resolveSafeOrigin(
   request: Request,
   env: Record<string, string | undefined> = process.env

@@ -1,57 +1,54 @@
-import { apiFailure, requireSuperadminApi } from '@/lib/chains/server';
+import { HANZI_APP_SCOPE } from '@/lib/chains/presets';
+import { apiFailure, HttpStatusError, requireSuperadminApi } from '@/lib/chains/server';
 import { CHAIN_UUID_PATTERN, validateStepInput } from '@/lib/chains/validation';
 
-type RouteContext = { params: Promise<{ id: string }> };
+type RouteCtx = { params: Promise<{ id: string }> };
 
-export async function POST(request: Request, context: RouteContext) {
+export async function POST(request: Request, context: RouteCtx) {
   try {
+    const { admin } = await requireSuperadminApi(request);
     const { id: chainId } = await context.params;
     if (!CHAIN_UUID_PATTERN.test(chainId)) {
-      throw new Error('Invalid chain ID.');
+      throw new HttpStatusError(400, 'Invalid chain ID.');
     }
-    const { admin } = await requireSuperadminApi(request);
-    const body = (await request.json()) as Record<string, unknown>;
-    const payload = validateStepInput(body, false);
 
-    const [{ data: chainRow, error: chainErr }, { data: existingSteps, error: stepErr }] =
-      await Promise.all([
-        admin.from('prompt_chains').select('id').eq('id', chainId).maybeSingle(),
-        admin
-          .from('prompt_chain_steps')
-          .select('step_order')
-          .eq('chain_id', chainId)
-          .order('step_order', { ascending: false })
-          .limit(1),
-      ]);
+    const { data: chain } = await admin
+      .from('prompt_chains')
+      .select('id')
+      .eq('id', chainId)
+      .eq('app_scope', HANZI_APP_SCOPE)
+      .maybeSingle();
 
-    if (chainErr) throw new Error(chainErr.message);
-    if (!chainRow) throw new Error('Prompt chain not found.');
-    if (stepErr) throw new Error(stepErr.message);
+    if (!chain) {
+      throw new HttpStatusError(404, 'Prompt chain not found.');
+    }
 
-    const maxOrder = Math.max(0, Number(existingSteps?.[0]?.step_order) || 0);
-    const nextOrder = maxOrder + 1;
+    const validated = validateStepInput(await request.json());
+    const { data: existing } = await admin
+      .from('prompt_chain_steps')
+      .select('step_order')
+      .eq('chain_id', chainId)
+      .order('step_order', { ascending: false })
+      .limit(1);
 
-    const { data, error } = await admin
+    const nextOrder = (existing?.[0]?.step_order ?? 0) + 1;
+
+    const { data: created, error } = await admin
       .from('prompt_chain_steps')
       .insert({
-        ...payload,
         chain_id: chainId,
         step_order: nextOrder,
+        ...validated,
       })
       .select('*')
       .single();
 
-    if (error) {
-      throw new Error(error.message);
+    if (error || !created) {
+      throw new Error(error?.message ?? 'Failed to add chain step.');
     }
 
-    await admin
-      .from('prompt_chains')
-      .update({ updated_at: new Date().toISOString() })
-      .eq('id', chainId);
-
-    return Response.json({ step: data }, { status: 201, headers: { 'Cache-Control': 'no-store' } });
-  } catch (err) {
-    return apiFailure(err);
+    return Response.json({ step: created }, { status: 201, headers: { 'Cache-Control': 'no-store' } });
+  } catch (error) {
+    return apiFailure(error);
   }
 }

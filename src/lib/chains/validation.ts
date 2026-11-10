@@ -1,527 +1,556 @@
-import type { StepExecutionTrace } from './types';
+import { HANZI_MODEL_CATALOG, resolveMethodTabForMode } from './presets';
+import type {
+  DecompositionMode,
+  HanziPartSpec,
+  LookupVerdict,
+  MnemonicCardData,
+  StepExecutionTrace,
+  StepModality,
+  StepProvider,
+} from './types';
 
 export const CHAIN_UUID_PATTERN =
-  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-export const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
+  /^\p{Hex_Digit}{8}(?:-\p{Hex_Digit}{4}){3}-\p{Hex_Digit}{12}$/u;
 
-export const ALLOWED_VISION_MIMES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/webp',
-  'image/gif',
-]);
-
-export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-
-export const STEP_ROLE_OPTIONS = [
-  { value: 'vision_analysis', label: 'vision_analysis', description: 'Extract concrete visual details from image' },
-  { value: 'anti_cliche_filter', label: 'anti_cliche_filter', description: 'Reject predictable puns & stale tropes' },
-  { value: 'twist_planner', label: 'twist_planner', description: 'Plan ironic human or engineering angle' },
-  { value: 'caption_synthesis', label: 'caption_synthesis', description: 'Synthesize 5 ranked funny captions' },
-  { value: 'system_persona', label: 'system_persona', description: 'Establish comedic voice & length rules' },
-  { value: 'punchline_writer', label: 'punchline_writer', description: 'Draft crisp setup and final-word turn' },
-  { value: 'custom_instruction', label: 'custom_instruction', description: 'Custom intermediate reasoning step' },
-] as const;
-
-export function escapePostgrestIlike(input: string): string {
-  return input.replace(/([\\%_])/g, '\\$1');
+export function escapePostgrestIlike(raw: string): string {
+  return raw.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
-export function slugifyChainName(raw: string): string {
-  return raw
-    .trim()
+export function normalizeDecompositionMode(
+  raw: unknown,
+  fallback: DecompositionMode = 'flexible'
+): DecompositionMode {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === 'compound_word' || s === 'compound-word') return 'compound_word';
+  if (s === 'compound_idea' || s === 'compound-idea') return 'compound_idea';
+  if (s === 'sound_meaning' || s === 'sound-meaning') return 'sound_meaning';
+  if (s === 'flexible') return 'flexible';
+  return fallback;
+}
+
+export function inferDecompositionModeFromChain(
+  slug: string,
+  explicitMode?: unknown
+): DecompositionMode {
+  if (typeof explicitMode === 'string' && explicitMode.trim()) {
+    const norm = normalizeDecompositionMode(explicitMode, 'flexible');
+    if (norm !== 'flexible') return norm;
+    if (slug === 'compound-word') return 'compound_word';
+    if (slug === 'compound-idea') return 'compound_idea';
+    if (slug === 'sound-meaning') return 'sound_meaning';
+    return norm;
+  }
+  if (slug === 'compound-word') return 'compound_word';
+  if (slug === 'compound-idea') return 'compound_idea';
+  if (slug === 'sound-meaning') return 'sound_meaning';
+  return 'flexible';
+}
+
+export function slugifyChainName(name: string): string {
+  const base = name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 56);
+    .slice(0, 42);
+  const suffix = Math.random().toString(36).slice(2, 6);
+  return `${base || 'hanzi-chain'}-${suffix}`;
 }
 
-export function validateChainInput(body: Record<string, unknown>, partial = false) {
-  const out: Record<string, unknown> = {};
-
-  if (!partial || body.name !== undefined) {
-    const name = typeof body.name === 'string' ? body.name.trim() : '';
-    if (name.length < 2 || name.length > 100) {
-      throw new Error('Chain name must be between 2 and 100 characters.');
-    }
-    out.name = name;
-  }
-
-  if (!partial || body.slug !== undefined) {
-    const rawSlug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
-    const candidate = rawSlug || (typeof out.name === 'string' ? slugifyChainName(out.name) : '');
-    if (!SLUG_RE.test(candidate)) {
-      throw new Error('Chain slug must be 2-63 lowercase letters, digits, or hyphens.');
-    }
-    out.slug = candidate;
-  }
-
-  if (!partial || body.persona_style !== undefined) {
-    const persona = typeof body.persona_style === 'string' ? body.persona_style.trim() : '';
-    if (persona.length < 6 || persona.length > 1200) {
-      throw new Error('System persona must be between 6 and 1,200 characters.');
-    }
-    out.persona_style = persona;
-  }
-
-  if (!partial || body.description !== undefined) {
-    const desc = typeof body.description === 'string' ? body.description.trim() : '';
-    if (desc.length > 600) {
-      throw new Error('Description cannot exceed 600 characters.');
-    }
-    out.description = desc;
-  }
-
-  if (!partial || body.mix_weight !== undefined) {
-    const weightNum = Number(body.mix_weight ?? 0);
-    if (!Number.isFinite(weightNum) || weightNum < 0 || weightNum > 100) {
-      throw new Error('Traffic weight must be an integer between 0 and 100.');
-    }
-    out.mix_weight = Math.round(weightNum);
-  }
-
-  if (!partial || body.is_active !== undefined) {
-    out.is_active = body.is_active === undefined ? true : Boolean(body.is_active);
-  }
-
-  return out;
+export function clampStepTemperature(raw: unknown, fallback = 0.35): number {
+  const num = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.round(Math.max(0, Math.min(2, num)) * 100) / 100;
 }
 
-export function validateStepInput(body: Record<string, unknown>, partial = false) {
-  const out: Record<string, unknown> = {};
-
-  if (!partial || body.step_name !== undefined) {
-    const stepName = typeof body.step_name === 'string' ? body.step_name.trim() : '';
-    if (stepName.length < 2 || stepName.length > 100) {
-      throw new Error('Step name must be between 2 and 100 characters.');
+// Normalizes any model ID onto the locked 5-model roster (strictly blocking high-cost Pro image & deprecated models).
+export function normalizeModelId(raw: unknown, modality: StepModality = 'text'): string {
+  const candidate = String(raw ?? '').trim();
+  const hit = HANZI_MODEL_CATALOG.find((m) => m.modelId === candidate);
+  if (hit) {
+    if (modality === 'image_generation' && hit.modality !== 'image_generation') {
+      return 'gemini-3.1-flash-lite-image';
     }
-    out.step_name = stepName;
+    if (modality === 'text' && hit.modality === 'image_generation') {
+      return 'gemini-3.5-flash-lite';
+    }
+    return hit.modelId;
   }
 
-  if (!partial || body.step_role !== undefined) {
-    const role = typeof body.step_role === 'string' ? body.step_role.trim() : 'custom_instruction';
-    if (!/^[a-z0-9_]{2,48}$/.test(role)) {
-      throw new Error('Step role must be 2-48 lowercase letters, digits, or underscores.');
-    }
-    out.step_role = role;
+  if (modality === 'image_generation') {
+    if (candidate.includes('nano-banana')) return 'gemini-nano-banana-2.1';
+    return 'gemini-3.1-flash-lite-image';
   }
 
-  if (!partial || body.instruction_template !== undefined) {
-    const tpl = typeof body.instruction_template === 'string' ? body.instruction_template.trim() : '';
-    if (tpl.length < 6 || tpl.length > 2400) {
-      throw new Error('Instruction template must be between 6 and 2,400 characters.');
-    }
-    out.instruction_template = tpl;
+  if (candidate.includes('3-flash') || candidate.includes('3.8')) {
+    return 'gemini-3-flash-preview';
   }
-
-  if (!partial || body.output_field !== undefined) {
-    const rawField = typeof body.output_field === 'string' ? body.output_field.trim() : '';
-    if (rawField.length > 80) {
-      throw new Error('Output field label cannot exceed 80 characters.');
-    }
-    out.output_field = rawField || null;
+  if (candidate.includes('3.1')) {
+    return 'gemini-3.1-flash-lite';
   }
-
-  return out;
+  return 'gemini-3.5-flash-lite';
 }
 
-export type TemplateSegment =
-  | { type: 'text'; value: string }
-  | { type: 'variable'; value: string };
-
-export function tokenizeTemplateVariables(template: string): TemplateSegment[] {
-  const re = /(\{\{\s*(?:input|prev_output|step_\d+_output)\s*\}\})/gi;
-  const segments: TemplateSegment[] = [];
-  let lastIdx = 0;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(template)) !== null) {
-    if (match.index > lastIdx) {
-      segments.push({ type: 'text', value: template.slice(lastIdx, match.index) });
-    }
-    segments.push({ type: 'variable', value: match[1] });
-    lastIdx = re.lastIndex;
-  }
-  if (lastIdx < template.length) {
-    segments.push({ type: 'text', value: template.slice(lastIdx) });
-  }
-  return segments;
+export function normalizeStepModality(raw: unknown, modelId: string): StepModality {
+  if (raw === 'image_generation') return 'image_generation';
+  const catalogHit = HANZI_MODEL_CATALOG.find((m) => m.modelId === modelId);
+  return catalogHit?.modality ?? 'text';
 }
 
-export function compileStepInstruction(params: {
-  personaStyle: string;
-  stepOrder: number;
-  totalSteps: number;
-  stepName: string;
-  stepRole: string;
-  instructionTemplate: string;
-  inputContext: string;
-  upstreamOutputs: readonly string[];
-}): string {
-  const {
-    personaStyle,
-    stepOrder,
-    totalSteps,
-    stepName,
-    stepRole,
-    instructionTemplate,
-    inputContext,
-    upstreamOutputs,
-  } = params;
+export function resolveProviderForModel(): StepProvider {
+  return 'gemini';
+}
 
-  const prevOutput = upstreamOutputs.length > 0 ? upstreamOutputs[upstreamOutputs.length - 1] : '';
-  const hasInputVar = /\{\{\s*input\s*\}\}/i.test(instructionTemplate);
-  const hasPrevOrStepVar = /\{\{\s*(?:prev_output|step_\d+_output)\s*\}\}/i.test(instructionTemplate);
+export function validateChainInput(
+  raw: unknown,
+  opts?: { isUpdate?: boolean }
+): {
+  name: string;
+  description: string;
+  persona_style: string;
+  decomposition_mode: DecompositionMode;
+  is_active: boolean;
+} {
+  const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const name = String(body.name ?? '').trim();
+  if (name.length < 2 || name.length > 90) {
+    throw new Error('Chain name must be between 2 and 90 characters.');
+  }
 
-  // Single-pass variable interpolation prevents recursive re-expansion if upstream output contains {{...}}
-  const interpolated = instructionTemplate.replace(
-    /\{\{\s*(input|prev_output|step_(\d+)_output)\s*\}\}/gi,
-    (_whole, token: string, stepNumRaw?: string) => {
-      const lower = token.toLowerCase();
-      if (lower === 'input') {
-        return inputContext || '(No extra premise supplied; rely on the visual scene.)';
-      }
-      if (lower === 'prev_output') {
-        return prevOutput || inputContext || '(None)';
-      }
-      if (stepNumRaw) {
-        const idx = Number.parseInt(stepNumRaw, 10) - 1;
-        if (idx >= 0 && idx < upstreamOutputs.length) {
-          return upstreamOutputs[idx];
-        }
-      }
-      return '';
-    }
+  const descRaw = String(body.description ?? '').trim();
+  const description = descRaw ? descRaw.slice(0, 400) : '';
+
+  const personaRaw = String(body.persona_style ?? '').trim();
+  const persona_style =
+    personaRaw.length >= 2
+      ? personaRaw.slice(0, 260)
+      : 'Clear pedagogical Chinese component mnemonics with vivid concrete visual objects and zero invented etymology.';
+
+  const decomposition_mode = normalizeDecompositionMode(
+    body.decomposition_mode,
+    opts?.isUpdate ? 'compound_word' : 'flexible'
+  );
+  const is_active = body.is_active === false ? false : true;
+
+  return { name, description, persona_style, decomposition_mode, is_active };
+}
+
+export function validateStepInput(raw: unknown): {
+  step_name: string;
+  step_role: string;
+  instruction_template: string;
+  output_field: string;
+  provider: StepProvider;
+  model_id: string;
+  temperature: number;
+  step_modality: StepModality;
+} {
+  const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const step_name = String(body.step_name ?? '').trim();
+  if (step_name.length < 2 || step_name.length > 80) {
+    throw new Error('Step name must be between 2 and 80 characters.');
+  }
+
+  const step_role = String(body.step_role ?? 'analysis')
+    .trim()
+    .slice(0, 40) || 'analysis';
+  const instruction_template = String(body.instruction_template ?? '').trim();
+  if (instruction_template.length < 4 || instruction_template.length > 4000) {
+    throw new Error('Step instruction template must be between 4 and 4000 characters.');
+  }
+
+  const output_field =
+    String(body.output_field ?? 'step_output')
+      .trim()
+      .replace(/[^a-zA-Z0-9_]/g, '_')
+      .slice(0, 48) || 'step_output';
+
+  const requestedModality: StepModality =
+    body.step_modality === 'image_generation' ? 'image_generation' : 'text';
+  const model_id = normalizeModelId(body.model_id, requestedModality);
+  const step_modality = normalizeStepModality(body.step_modality, model_id);
+  const provider = resolveProviderForModel();
+  const temperature = clampStepTemperature(
+    body.temperature,
+    step_modality === 'image_generation' ? 0.6 : 0.25
   );
 
-  const lines: string[] = [
-    personaStyle.trim() ||
-      'You are a sharp comedy writer crafting concrete, original visual captions.',
-    `Pipeline Stage ${stepOrder} of ${totalSteps} — ${stepName} (${stepRole}):`,
-    interpolated,
-  ];
-
-  if (stepOrder === 1 && !hasInputVar && inputContext.trim()) {
-    lines.push(`Scene / Premise Context ({{input}}):\n${inputContext.trim()}`);
-  }
-
-  if (stepOrder > 1 && !hasPrevOrStepVar && prevOutput.trim()) {
-    lines.push(`Upstream Step Output ({{prev_output}}):\n${prevOutput.trim()}`);
-  }
-
-  if (stepOrder === totalSteps) {
-    lines.push(
-      'Final Output Contract: Return strictly a valid JSON object matching {"captions": ["...", "...", "...", "...", "..."]} with exactly 5 distinct, punchy funny captions (6-18 words each) and no markdown fences.'
-    );
-  } else {
-    lines.push(
-      'Intermediate Output Contract: Return concise, concrete prose (2-4 sentences) for the next step in the prompt chain, without writing the final 5 captions yet.'
-    );
-  }
-
-  return lines.join('\n\n');
+  return {
+    step_name,
+    step_role,
+    instruction_template,
+    output_field,
+    provider,
+    model_id,
+    temperature,
+    step_modality,
+  };
 }
 
-export function parseFiveCaptions(rawText: string): string[] {
-  const trimmed = rawText.trim();
-  if (!trimmed) {
-    throw new Error('invalid_output');
-  }
+const PART_COLOR_DESCRIPTIONS = [
+  'crimson-red (#E03131)',
+  'cobalt-blue (#1971C2)',
+  'emerald-green (#0CA678)',
+  'warm-amber (#D97706)',
+] as const;
 
-  let candidateJson = trimmed
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/i, '')
+export function buildLookupFactPacketJson(lookup: LookupVerdict): string {
+  return JSON.stringify(
+    {
+      input: lookup.input,
+      pinyin: lookup.pinyin,
+      english_meaning: lookup.english_meaning,
+      decomposition_method: lookup.effective_mode,
+      etymology_type: lookup.etymology_type,
+      etymology_hint: lookup.etymology_hint,
+      anti_target_do_not_draw: lookup.anti_target,
+      parts: lookup.parts.map((p, idx) => ({
+        part_number: p.part_number,
+        glyph: p.glyph,
+        pinyin: p.pinyin,
+        meaning: p.gloss,
+        role: p.role,
+        sound_note: p.sound_note ?? null,
+        suggested_accessory_tint: PART_COLOR_DESCRIPTIONS[idx] ?? PART_COLOR_DESCRIPTIONS[0],
+      })),
+    },
+    null,
+    2
+  );
+}
+
+export function compileMnemonicStepInstruction(params: {
+  template: string;
+  lookup: LookupVerdict;
+  chainName: string;
+  personaStyle: string;
+  priorOutputs: readonly StepExecutionTrace[];
+}): string {
+  const { template, lookup, chainName, personaStyle, priorOutputs } = params;
+  const lookupJson = buildLookupFactPacketJson(lookup);
+  const prev = priorOutputs.length > 0 ? priorOutputs[priorOutputs.length - 1].output_text : '';
+  const referencedUpstream = /\{\{\s*(prev_output|step_\d+_output|lookup_json)\s*\}\}/i.test(
+    template
+  );
+
+  let compiled = template
+    .replace(/\{\{\s*input\s*\}\}/gi, lookup.input)
+    .replace(/\{\{\s*pinyin\s*\}\}/gi, lookup.pinyin)
+    .replace(/\{\{\s*meaning\s*\}\}/gi, lookup.english_meaning)
+    .replace(/\{\{\s*anti_target\s*\}\}/gi, lookup.anti_target)
+    .replace(/\{\{\s*lookup_json\s*\}\}/gi, lookupJson)
+    .replace(/\{\{\s*prev_output\s*\}\}/gi, prev)
+    .replace(/\{\{\s*chain_name\s*\}\}/gi, chainName)
+    .replace(/\{\{\s*persona_style\s*\}\}/gi, personaStyle);
+
+  compiled = compiled.replace(/\{\{\s*step_(\d+)_output\s*\}\}/gi, (_, idxStr: string) => {
+    const idx = Number(idxStr);
+    const hit = priorOutputs[idx - 1];
+    return hit ? hit.output_text : '';
+  });
+
+  const header =
+    `Chain: ${chainName} (${lookup.effective_mode})\n` +
+    `Editorial Persona: ${personaStyle}\n` +
+    `Target Item: ${lookup.input} (${lookup.pinyin} — "${lookup.english_meaning}")\n` +
+    `Forbidden Ordinary Appearance (DO NOT DRAW): ${lookup.anti_target}\n\n`;
+
+  const extraContext = !referencedUpstream
+    ? priorOutputs.length === 0
+      ? `\n\nDeterministic Dataset Lookup:\n${lookupJson}`
+      : `\n\nUpstream Step ${priorOutputs.length} Output:\n${prev}`
+    : '';
+
+  return `${header}${compiled.trim()}${extraContext}`;
+}
+
+export function stripCjkAndControlChars(raw: string): string {
+  return raw
+    .replace(/[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
+}
 
-  if (!candidateJson.startsWith('{') && !candidateJson.startsWith('[')) {
-    const objStart = candidateJson.indexOf('{');
-    const objEnd = candidateJson.lastIndexOf('}');
-    if (objStart >= 0 && objEnd > objStart) {
-      candidateJson = candidateJson.slice(objStart, objEnd + 1);
+function stripJsonCodeFences(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+  return trimmed;
+}
+
+const TRAILING_DANGLING_STOPWORDS =
+  /\s+\b(?:a|an|the|and|or|but|with|without|in|on|at|to|of|for|by|into|from|beneath|under|over|above|beside|near|positioned|placed|colored|coloured|directly|wearing|holding|having|reflecting|that|which|is|are)$/i;
+
+export function truncateAtWordBoundary(raw: string, maxChars: number): string {
+  const clean = raw
+    .replace(/\s+/g, ' ')
+    .replace(/^[(\s]+|[)\s]+$/g, '')
+    .trim();
+  let out = clean;
+  if (clean.length > maxChars) {
+    const sliced = clean.slice(0, maxChars);
+    const lastBreak = Math.max(
+      sliced.lastIndexOf(' '),
+      sliced.lastIndexOf(','),
+      sliced.lastIndexOf(';')
+    );
+    out = lastBreak >= Math.floor(maxChars * 0.4) ? sliced.slice(0, lastBreak) : sliced;
+  }
+  let prev = '';
+  while (out !== prev) {
+    prev = out;
+    out = out
+      .replace(/[,;:\s.-]+$/g, '')
+      .replace(TRAILING_DANGLING_STOPWORDS, '')
+      .trim();
+  }
+  return out;
+}
+
+export function primaryGlossNoun(gloss: string): string {
+  const first = gloss
+    .split(/[,;/]/)
+    .map((s) => s.trim())
+    .find(Boolean);
+  return first || gloss.trim();
+}
+
+export function formatLiveTracePreview(raw: string): string {
+  const trimmed = stripJsonCodeFences(raw);
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof parsed.mnemonic_hook === 'string' && parsed.mnemonic_hook.trim()) {
+        return parsed.mnemonic_hook.replace(/\s+/g, ' ').trim();
+      }
+    } catch {
+      // Fall through to plain-text Markdown stripping below
     }
   }
+  return raw
+    .replace(/```[a-z]*\n?/gi, ' ')
+    .replace(/```/g, ' ')
+    .replace(/^\s*[-*•]\s+/gm, ' · ')
+    .replace(/^\s*#{1,6}\s+/gm, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/(^|\s)\*(?=\S)|(?<=\S)\*(?=\s|$)/g, '$1')
+    .replace(/[\r\n]+/g, ' · ')
+    .replace(/(?:\s*·\s*)+/g, ' · ')
+    .replace(/^\s*·\s*|\s*·\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  try {
-    const parsed = JSON.parse(candidateJson);
-    const rawList = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed?.captions)
-        ? parsed.captions
-        : Array.isArray(parsed?.jokes)
-          ? parsed.jokes
-          : typeof parsed?.setup === 'string' && typeof parsed?.punchline === 'string'
-            ? [`${parsed.setup.trim()} ${parsed.punchline.trim()}`.trim()]
-            : null;
+export const ZERO_TEXT_MARGIN_GUARDRAIL =
+  'Full-shot centered 1:1 storybook gouache-and-ink illustration with generous 15% empty neutral cream margin on all four edges so no object touches the border. Keep natural animal fur and skin textures while placing subtle crimson-red, cobalt-blue, or emerald-green accents on collars, clothing, ribbons, props, or foliage. STRICTLY ZERO TEXT: no Chinese characters, no Hanzi, no English letters, no words, no numbers, no labels, no speech bubbles, no signs, no watermarks.';
 
-    if (rawList) {
-      const cleaned = rawList
-        .map((item: unknown) => {
-          if (typeof item === 'string') return item.trim();
+export function buildFallbackZeroTextImagePrompt(lookup: LookupVerdict): string {
+  const partPhrases = lookup.parts.map((p, idx) => {
+    const colorTag = PART_COLOR_DESCRIPTIONS[idx] ?? 'crimson-red';
+    if (p.role === 'SOUND_ONLY') {
+      return `a concrete ${p.gloss} accented with ${colorTag} ringing a gleaming golden brass bell emitting concentric circular sound-wave ripples`;
+    }
+    return `a concrete ${p.gloss} accented with ${colorTag}`;
+  });
+  return (
+    `Combine ${partPhrases.join(' and ')} together in one single vivid, absurd storybook scene. ` +
+    `Do NOT draw ${lookup.anti_target}. ${ZERO_TEXT_MARGIN_GUARDRAIL}`
+  );
+}
+
+export function compileCardFromTextTraces(params: {
+  lookup: LookupVerdict;
+  rawStepText: string;
+  textOnlyPreview: boolean;
+  dailyCapReached?: boolean;
+}): { card: MnemonicCardData; imagePrompt: string } {
+  const { lookup, rawStepText, textOnlyPreview, dailyCapReached } = params;
+  const tabSpec = resolveMethodTabForMode(lookup.effective_mode);
+
+  let mnemonicHook = '';
+  let compiledPrompt = '';
+  const cueByPart = new Map<number, string>();
+
+  if (rawStepText.trim()) {
+    try {
+      const parsed = JSON.parse(stripJsonCodeFences(rawStepText)) as Record<string, unknown>;
+      if (typeof parsed.mnemonic_hook === 'string') {
+        mnemonicHook = parsed.mnemonic_hook.trim();
+      } else if (typeof parsed.mnemonic_story === 'string') {
+        mnemonicHook = parsed.mnemonic_story.trim();
+      }
+      if (typeof parsed.image_prompt === 'string') {
+        compiledPrompt = stripCjkAndControlChars(parsed.image_prompt);
+      }
+      if (Array.isArray(parsed.legend_items)) {
+        for (const item of parsed.legend_items) {
           if (item && typeof item === 'object') {
             const rec = item as Record<string, unknown>;
-            if (typeof rec.caption === 'string') return rec.caption.trim();
-            if (typeof rec.text === 'string') return rec.text.trim();
-            if (typeof rec.setup === 'string' && typeof rec.punchline === 'string') {
-              return `${rec.setup.trim()} ${rec.punchline.trim()}`.trim();
+            const pNum = Number(rec.part_number);
+            const cue = String(rec.scene_cue ?? rec.spot_in_scene ?? '').trim();
+            if (Number.isFinite(pNum) && cue) {
+              cueByPart.set(pNum, truncateAtWordBoundary(cue, 64));
             }
           }
-          return '';
-        })
-        .filter((s: string) => s.length > 0)
-        .slice(0, 5);
-      if (cleaned.length > 0) {
-        return cleaned;
+        }
       }
+    } catch {
+      // If a user reordered steps so the last text step emitted prose instead of JSON, extract cleanly.
+      const cleanProse = rawStepText.replace(/\*\*/g, '').trim();
+      mnemonicHook = cleanProse.split(/\n+/)[0]?.slice(0, 260) ?? '';
+      compiledPrompt = stripCjkAndControlChars(cleanProse.slice(0, 420));
     }
-  } catch {
-    // Fall back to numbered/bulleted line extraction when a non-JSON provider returns plain lines.
   }
 
-  const lines = trimmed
-    .split(/\r?\n/)
-    .map((line) =>
-      line
-        .replace(/^```[a-z]*$/i, '')
-        .replace(/^\s*(?:[-*•]|\d+[.)]|#\d+[:]?)\s*/, '')
-        .replace(/^["“]|["”]$/g, '')
-        .trim()
-    )
-    .filter((line) => line.length >= 6 && !line.startsWith('{') && !line.startsWith('}'));
-
-  if (lines.length === 0) {
-    throw new Error('invalid_output');
+  if (!mnemonicHook) {
+    mnemonicHook =
+      lookup.effective_mode === 'sound_meaning'
+        ? `Spot ${lookup.parts[0]?.gloss} (${lookup.parts[0]?.glyph}) for the meaning "${lookup.english_meaning}", while ${lookup.parts[1]?.gloss} (${lookup.parts[1]?.glyph}, ${lookup.parts[1]?.pinyin}) rings a bell strictly to cue the sound "${lookup.pinyin}".`
+        : `Combine ${lookup.parts.map((p) => `${p.gloss} (${p.glyph})`).join(' + ')} in one scene to remember "${lookup.english_meaning}" (${lookup.pinyin}).`;
   }
-  return lines.slice(0, 5);
+
+  const finalImagePrompt = compiledPrompt
+    ? `${compiledPrompt} Do NOT draw ${lookup.anti_target}. ${ZERO_TEXT_MARGIN_GUARDRAIL}`
+    : buildFallbackZeroTextImagePrompt(lookup);
+
+  const legendItems: HanziPartSpec[] = lookup.parts.map((p) => ({
+    ...p,
+    scene_cue:
+      cueByPart.get(p.part_number) ??
+      (p.role === 'SOUND_ONLY'
+        ? `${p.gloss} with brass bell (cues sound ${lookup.pinyin})`
+        : `${p.gloss} in scene`),
+  }));
+
+  const circled = ['①', '②', '③', '④'];
+  const sceneChecklist = `${legendItems
+    .map((item, idx) => {
+      const noun = primaryGlossNoun(item.gloss);
+      const tag =
+        item.role === 'SOUND_ONLY' ? `${noun} bell (sound ${lookup.pinyin})` : noun;
+      return `${circled[idx] ?? `${idx + 1}.`} ${tag}`;
+    })
+    .join(' + ')} (0 text in image)`;
+
+  return {
+    card: {
+      input: lookup.input,
+      pinyin: lookup.pinyin,
+      english_meaning: lookup.english_meaning,
+      chain_mode: lookup.effective_mode,
+      method_badge: tabSpec.methodBadge,
+      etymology_hint: lookup.etymology_hint,
+      mnemonic_hook: mnemonicHook,
+      glyphs: lookup.glyphs,
+      legend_items: legendItems,
+      scene_checklist: sceneChecklist,
+      image_prompt: finalImagePrompt,
+      text_only_preview: textOnlyPreview,
+      daily_cap_reached: dailyCapReached,
+    },
+    imagePrompt: finalImagePrompt,
+  };
 }
 
 export function normalizeRunStepOutputs(raw: unknown): StepExecutionTrace[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((item, idx) => {
-    const rec = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
-    const stepOrder = Number(rec.step_order ?? rec.stepOrder ?? idx + 1);
-    const latency = Number(rec.latency_ms ?? rec.latencyMs ?? 0);
-    const inTok = rec.input_tokens ?? rec.inputTokens;
-    const outTok = rec.output_tokens ?? rec.outputTokens;
+    const r = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    const step_modality: StepModality =
+      r.step_modality === 'image_generation' ? 'image_generation' : 'text';
     return {
-      step_order: Number.isFinite(stepOrder) && stepOrder > 0 ? stepOrder : idx + 1,
-      step_id: typeof (rec.step_id ?? rec.stepId) === 'string' ? String(rec.step_id ?? rec.stepId) : null,
-      step_name: String(rec.step_name ?? rec.stepName ?? `Step ${idx + 1}`),
-      step_role: String(rec.step_role ?? rec.stepRole ?? 'instruction'),
-      output_field:
-        typeof (rec.output_field ?? rec.outputField) === 'string' && String(rec.output_field ?? rec.outputField).trim()
-          ? String(rec.output_field ?? rec.outputField).trim()
-          : null,
-      compiled_prompt: String(rec.compiled_prompt ?? rec.compiledPrompt ?? rec.prompt ?? ''),
-      output_text: String(rec.output_text ?? rec.outputText ?? rec.output ?? ''),
-      latency_ms: Number.isFinite(latency) && latency >= 0 ? Math.round(latency) : 0,
-      input_tokens: typeof inTok === 'number' && Number.isFinite(inTok) ? inTok : null,
-      output_tokens: typeof outTok === 'number' && Number.isFinite(outTok) ? outTok : null,
+      step_order: Number(r.step_order) || idx + 1,
+      step_name: String(r.step_name ?? `Step ${idx + 1}`),
+      step_role: String(r.step_role ?? 'step'),
+      output_field: String(r.output_field ?? 'output'),
+      provider: 'gemini',
+      model_id: normalizeModelId(r.model_id, step_modality),
+      temperature: clampStepTemperature(r.temperature, 0.3),
+      step_modality,
+      compiled_prompt: String(r.compiled_prompt ?? ''),
+      output_text: String(r.output_text ?? ''),
+      latency_ms: Number(r.latency_ms) || 0,
+      tokens: Number(r.tokens) || 0,
     };
   });
 }
 
-export function normalizeFinalCaptions(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map((item) => {
-      if (typeof item === 'string') return item.trim();
-      if (item && typeof item === 'object') {
-        const rec = item as Record<string, unknown>;
-        if (typeof rec.caption === 'string') return rec.caption.trim();
-        if (typeof rec.text === 'string') return rec.text.trim();
-        if (typeof rec.setup === 'string' && typeof rec.punchline === 'string') {
-          return `${rec.setup.trim()} ${rec.punchline.trim()}`.trim();
-        }
-      }
-      return '';
+export function normalizeStoredCard(
+  rawCard: unknown,
+  fallbackLookup: LookupVerdict,
+  hasMedia: boolean
+): MnemonicCardData {
+  const c = (rawCard && typeof rawCard === 'object' ? rawCard : {}) as Record<string, unknown>;
+  const tabSpec = resolveMethodTabForMode(fallbackLookup.effective_mode);
+
+  const legendRaw = Array.isArray(c.legend_items) ? c.legend_items : [];
+  const legendItems: HanziPartSpec[] =
+    legendRaw.length > 0
+      ? legendRaw.map((item, idx) => {
+          const rec = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+          const fb = fallbackLookup.parts[idx];
+          const role = rec.role === 'SOUND_ONLY' || fb?.role === 'SOUND_ONLY' ? 'SOUND_ONLY' : 'MEANING';
+          return {
+            part_number: Number(rec.part_number) || idx + 1,
+            glyph: String(rec.glyph ?? fb?.glyph ?? ''),
+            pinyin: String(rec.pinyin ?? fb?.pinyin ?? ''),
+            gloss: String(rec.gloss ?? fb?.gloss ?? ''),
+            role,
+            role_badge: String(
+              rec.role_badge ??
+                fb?.role_badge ??
+                (role === 'SOUND_ONLY' ? '♪ SOUND PART · FOR PRONUNCIATION ONLY' : 'MEANING PART')
+            ),
+            sound_note:
+              typeof rec.sound_note === 'string' ? rec.sound_note : fb?.sound_note,
+            scene_cue:
+              typeof rec.scene_cue === 'string' && rec.scene_cue.trim()
+                ? truncateAtWordBoundary(rec.scene_cue, 64)
+                : undefined,
+          };
+        })
+      : fallbackLookup.parts;
+
+  const circled = ['①', '②', '③', '④'];
+  const defaultChecklist = `${legendItems
+    .map((it, idx) => {
+      const noun = primaryGlossNoun(it.gloss);
+      const tag =
+        it.role === 'SOUND_ONLY'
+          ? `${noun} bell (sound ${fallbackLookup.pinyin})`
+          : noun;
+      return `${circled[idx] ?? `${idx + 1}.`} ${tag}`;
     })
-    .filter(Boolean);
-}
+    .join(' + ')} (0 text in image)`;
 
-function parseIpv4Octets(host: string): [number, number, number, number] | null {
-  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return null;
-  const parts = host.split('.').map((p) => Number.parseInt(p, 10));
-  if (parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
-  return [parts[0], parts[1], parts[2], parts[3]];
-}
-
-type Ipv6Hextets = [number, number, number, number, number, number, number, number];
-
-function parseIpv6Hextets(raw: string): Ipv6Hextets | null {
-  let clean = raw.trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (!clean || clean.includes('%') || !/^[0-9a-f:.]+$/.test(clean)) {
-    return null;
-  }
-
-  // Convert trailing embedded dotted-quad IPv4 (e.g. ::ffff:127.0.0.1) into two 16-bit hex groups
-  if (clean.includes('.')) {
-    const lastColon = clean.lastIndexOf(':');
-    if (lastColon < 0) return null;
-    const v4Part = clean.slice(lastColon + 1);
-    const octets = parseIpv4Octets(v4Part);
-    if (!octets) return null;
-    const hi = ((octets[0] << 8) | octets[1]).toString(16);
-    const lo = ((octets[2] << 8) | octets[3]).toString(16);
-    clean = `${clean.slice(0, lastColon + 1)}${hi}:${lo}`;
-  }
-
-  const doubleColonParts = clean.split('::');
-  if (doubleColonParts.length > 2) return null;
-
-  let groups: string[];
-  if (doubleColonParts.length === 2) {
-    const left = doubleColonParts[0] ? doubleColonParts[0].split(':') : [];
-    const right = doubleColonParts[1] ? doubleColonParts[1].split(':') : [];
-    const missing = 8 - (left.length + right.length);
-    if (missing < 1) return null;
-    groups = [...left, ...Array.from({ length: missing }, () => '0'), ...right];
-  } else {
-    groups = clean.split(':');
-    if (groups.length !== 8) return null;
-  }
-
-  if (groups.length !== 8) return null;
-  const nums: number[] = [];
-  for (const g of groups) {
-    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
-    nums.push(Number.parseInt(g, 16));
-  }
-  return nums as Ipv6Hextets;
-}
-
-export function isPublicIpAddress(ipRaw: string): boolean {
-  const clean = ipRaw.trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (!clean) return false;
-
-  const v4 = parseIpv4Octets(clean);
-  if (v4) {
-    return isPublicIpv4(v4);
-  }
-
-  if (!clean.includes(':')) {
-    return false;
-  }
-
-  const h = parseIpv6Hextets(clean);
-  if (!h) return false;
-
-  // IPv4-mapped IPv6 ::ffff:0:0/96 (handles both ::ffff:127.0.0.1 and URL-normalized ::ffff:7f00:1)
-  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff) {
-    return isPublicIpv4([(h[6] >> 8) & 0xff, h[6] & 0xff, (h[7] >> 8) & 0xff, h[7] & 0xff]);
-  }
-
-  // Require IANA Global Unicast 2000::/3 (blocks ::/128, ::1/128, ::/96 IPv4-compatible,
-  // 64:ff9b::/96 & 64:ff9b:1::/48 NAT64, 100::/64 discard, fc00::/7 ULA, fe80::/10 link-local, ff00::/8 multicast)
-  if ((h[0] & 0xe000) !== 0x2000) {
-    return false;
-  }
-
-  // Special-purpose prefixes inside 2000::/3:
-  // 2001:0000::/32 Teredo, 2001:0002:0000::/48 Benchmarking, 2001:0db8::/32 Documentation,
-  // 2001:0010::/28 & 2001:0020::/28 ORCHID / ORCHIDv2
-  if (h[0] === 0x2001) {
-    if (h[1] === 0x0000) return false;
-    if (h[1] === 0x0002 && h[2] === 0x0000) return false;
-    if (h[1] === 0x0db8) return false;
-    if ((h[1] & 0xfff0) === 0x0010 || (h[1] & 0xfff0) === 0x0020) return false;
-  }
-
-  // 2002::/16 6to4 embeds an IPv4 address in h[1..2]
-  if (h[0] === 0x2002) {
-    return isPublicIpv4([(h[1] >> 8) & 0xff, h[1] & 0xff, (h[2] >> 8) & 0xff, h[2] & 0xff]);
-  }
-
-  return true;
-}
-
-function isPublicIpv4([a, b, c]: [number, number, number, number]): boolean {
-  if (a === 0 || a === 10 || a === 127) return false;
-  if (a === 169 && b === 254) return false;
-  if (a === 172 && b >= 16 && b <= 31) return false;
-  if (a === 192 && b === 168) return false;
-  if (a === 100 && b >= 64 && b <= 127) return false;
-  if (a === 192 && b === 0 && (c === 0 || c === 2)) return false;
-  if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return false;
-  if (a === 203 && b === 0 && c === 113) return false;
-  if (a >= 224) return false;
-  return true;
-}
-
-export function validateExternalImageUrl(rawUrl: string): URL {
-  const trimmed = rawUrl.trim();
-  if (!trimmed || trimmed.length > 2048) {
-    throw new Error('Provide an https:// image URL (up to 2,048 characters).');
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    throw new Error('Invalid image URL format.');
-  }
-
-  if (parsed.protocol !== 'https:') {
-    throw new Error('External image URLs must use https://.');
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error('Image URLs cannot embed credentials.');
-  }
-  if (parsed.port && parsed.port !== '443') {
-    throw new Error('External image URLs must use standard HTTPS port 443.');
-  }
-
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (
-    !host ||
-    host === 'localhost' ||
-    host.endsWith('.localhost') ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal') ||
-    host === 'metadata.google.internal' ||
-    /^(?:0x[0-9a-f]+|\d+)$/i.test(host)
-  ) {
-    throw new Error('Private, loopback, or internal image hosts are not allowed.');
-  }
-
-  if (parseIpv4Octets(host) || host.includes(':')) {
-    if (!isPublicIpAddress(host)) {
-      throw new Error('Private or loopback IP addresses are not allowed.');
-    }
-  } else if (!host.includes('.')) {
-    throw new Error('Image URL hostname must be a public domain.');
-  }
-
-  return parsed;
-}
-
-export function parseBoundedImageDataUrl(rawDataUrl: string): {
-  mimeType: string;
-  base64Data: string;
-  dataUrl: string;
-  byteLength: number;
-} {
-  const trimmed = rawDataUrl.trim();
-  const match = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(trimmed);
-  if (!match) {
-    throw new Error('Image data must be a base64-encoded PNG, JPEG, WebP, or GIF image.');
-  }
-  const mimeType = match[1].toLowerCase();
-  if (!ALLOWED_VISION_MIMES.has(mimeType)) {
-    throw new Error(
-      `Unsupported vision MIME type "${mimeType}". Use PNG, JPEG, WebP, or GIF (SVG scenes must be rasterized to PNG).`
-    );
-  }
-  const base64Data = match[2].replace(/\s+/g, '');
-  const buf = Buffer.from(base64Data, 'base64');
-  if (buf.byteLength < 16) {
-    throw new Error('Uploaded image payload is empty or corrupted.');
-  }
-  if (buf.byteLength > MAX_IMAGE_BYTES) {
-    throw new Error('Image exceeds the 4 MB maximum upload size.');
-  }
   return {
-    mimeType,
-    base64Data: buf.toString('base64'),
-    dataUrl: `data:${mimeType};base64,${buf.toString('base64')}`,
-    byteLength: buf.byteLength,
+    input: String(c.input ?? fallbackLookup.input),
+    pinyin: String(c.pinyin ?? fallbackLookup.pinyin),
+    english_meaning: String(c.english_meaning ?? fallbackLookup.english_meaning),
+    chain_mode:
+      c.chain_mode === 'compound_idea' || c.chain_mode === 'sound_meaning'
+        ? c.chain_mode
+        : fallbackLookup.effective_mode,
+    method_badge: String(c.method_badge ?? tabSpec.methodBadge),
+    etymology_hint:
+      typeof c.etymology_hint === 'string' ? c.etymology_hint : fallbackLookup.etymology_hint,
+    mnemonic_hook: String(
+      c.mnemonic_hook ??
+        `Combine ${legendItems.map((l) => `${l.gloss} (${l.glyph})`).join(' + ')} to remember "${fallbackLookup.english_meaning}".`
+    ),
+    // Always hydrate accurate stroke SVGs & colour indices from the bundled Make Me a Hanzi dataset!
+    glyphs: fallbackLookup.glyphs,
+    legend_items: legendItems,
+    scene_checklist:
+      typeof c.scene_checklist === 'string' && !c.scene_checklist.includes(',')
+        ? c.scene_checklist
+        : defaultChecklist,
+    image_prompt: String(c.image_prompt ?? buildFallbackZeroTextImagePrompt(fallbackLookup)),
+    text_only_preview: typeof c.text_only_preview === 'boolean' ? c.text_only_preview : !hasMedia,
+    daily_cap_reached: Boolean(c.daily_cap_reached),
   };
 }

@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 
-export type ChainSelectOption = {
+export type AppSelectOption = {
   value: string;
   label: string;
   description?: string;
@@ -19,7 +19,7 @@ export type ChainSelectOption = {
 type Props = {
   value: string;
   onChange: (value: string) => void;
-  options: readonly ChainSelectOption[];
+  options: readonly AppSelectOption[];
   id?: string;
   ariaLabel?: string;
   placeholder?: string;
@@ -34,13 +34,13 @@ type MenuCoords = {
   maxHeight: number;
 };
 
-export function ChainSelect({
+export function AppSelect({
   value,
   onChange,
   options,
   id,
   ariaLabel,
-  placeholder = 'Select…',
+  placeholder = 'Choose option…',
   compact = false,
   disabled = false,
 }: Props) {
@@ -66,15 +66,15 @@ export function ChainSelect({
       return;
     }
 
-    const desiredWidth = Math.max(rect.width, compact ? 156 : 210);
-    const width = Math.min(desiredWidth, Math.max(136, vw - 16));
+    const desiredWidth = Math.max(rect.width, compact ? 168 : 240);
+    const width = Math.min(desiredWidth, Math.max(140, vw - 16));
     const left = Math.max(8, Math.min(rect.left, vw - width - 8));
 
     const spaceBelow = vh - rect.bottom - 12;
     const spaceAbove = rect.top - 12;
     const openUpward = spaceBelow < 180 && spaceAbove > spaceBelow;
-    const maxHeight = Math.max(120, Math.min(272, openUpward ? spaceAbove : spaceBelow));
-    const estimatedMenuHeight = Math.min(maxHeight, options.length * 38 + 12);
+    const maxHeight = Math.max(130, Math.min(296, openUpward ? spaceAbove : spaceBelow));
+    const estimatedMenuHeight = Math.min(maxHeight, options.length * 44 + 12);
     const top = openUpward
       ? Math.max(8, rect.top - estimatedMenuHeight - 5)
       : rect.bottom + 5;
@@ -153,6 +153,7 @@ export function ChainSelect({
 
     if (e.key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
       setOpen(false);
       return;
     }

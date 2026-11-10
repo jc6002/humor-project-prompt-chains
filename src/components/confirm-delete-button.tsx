@@ -12,7 +12,7 @@ type Props = {
 export function ConfirmDeleteButton({
   onConfirm,
   disabled = false,
-  label = '🗑 Delete',
+  label = 'Delete',
   confirmLabel = 'Confirm',
   ariaLabel,
 }: Props) {
@@ -28,7 +28,7 @@ export function ConfirmDeleteButton({
     return (
       <button
         type="button"
-        className="chip chip-danger"
+        className="step-ctrl-btn step-ctrl-danger"
         disabled={disabled}
         aria-label={ariaLabel}
         onClick={() => setArmed(true)}
@@ -53,7 +53,7 @@ export function ConfirmDeleteButton({
       </button>
       <button
         type="button"
-        className="chip"
+        className="step-ctrl-btn"
         disabled={disabled}
         onClick={() => setArmed(false)}
       >

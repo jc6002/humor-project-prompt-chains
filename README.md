@@ -1,33 +1,39 @@
-# AI Joke Lab — Prompt Chain Studio (`humor-project-prompt-chains`)
+# Hanzi Parts Studio (`hanzi-mnemonic-deck`)
 
-Standalone Week 8 superadmin workbench for authoring, reordering, testing, and inspecting multi-step multimodal vision-to-humor prompt pipelines against the shared AI Joke Lab Supabase backend.
+**One Card, One Job**: An English-speaking learner enters **one Simplified Chinese character or compound word** (or clicks a 1-click sample chip) and gets **one stroke-coloured visual mnemonic flashcard**.
 
-## Highlights
-
-- **Superadmin Google OAuth Gate (`profiles.is_superadmin == TRUE`)**: Middleware cookie refresh, origin-hardened OAuth callbacks, self-service `403` SQL bootstrap panel for non-superadmin accounts, and server-side superadmin enforcement across every `/api/*` endpoint.
-- **Prompt Chain & Pipeline Step Studio**: Full CRUD for `prompt_chains` and `prompt_chain_steps`, template variable insertion chips (`{{input}}`, `{{prev_output}}`, `{{step_1_output}}`, ...), and `23505`-proof atomic two-phase step reordering (`↑` / `↓` and custom `Move to #` listbox).
-- **Live Sequential Multimodal Runner**: Runs ordered steps sequentially (`Step 1 -> Step 2 -> ... -> Step K`) across OpenAI (`openai_responses`, `openai_chat_completions`), Google Gemini (`gemini_generate_content`), and Anthropic (`anthropic_messages`) using built-in SVG sample scenes (client-rasterized to PNG), uploaded images (`PNG/JPEG/WebP/GIF`), or SSRF-guarded `https://` image URLs.
-- **Chain-Filtered Generated Media Gallery**: Displays uncropped source visuals alongside the final 5 funny captions and an expandable step-by-step intermediate output waterfall with compiled prompts, token counts, and per-step latencies.
-- **Zero-FOUC Light / Dark / System Theme**: Semantic CSS custom properties meeting WCAG AAA contrast (`>= 7:1`) in both Dark obsidian-lime and Light editorial forest-emerald palettes.
+- **Deterministic Stroke & Component Grounding (`$0.00`, `0` Hallucinated Characters)**:
+  - Character stroke paths and sub-character decompositions come from **Make Me a Hanzi** (`dictionary.txt` under LGPL v3+, `graphics.txt` under the Arphic Public License).
+  - Multi-character compound word readings, glosses, and polyphone syllable alignments come from **CC-CEDICT** (CC BY-SA 4.0).
+  - Honest **Chain Fit Check** stops before any LLM call (`$0.00`) when an item does not match the active decomposition method (for example, entering `妈` on `Compound Idea`) rather than inventing false etymology.
+- **Three Seeded Linguistic Decomposition Chains**:
+  1. **`Compound Word` (Default)**: `2–4` character words whose characters combine literal meanings (`猫头鹰` owl = cat + head + eagle; `电脑` computer = electricity + brain).
+  2. **`Compound Idea`**: Ideographic characters whose components combine meaning (`休` rest = person + tree; `森` forest = three trees).
+  3. **`Sound + Meaning`**: Pictophonetic characters pairing one `MEANING PART` with one `♪ SOUND PART · FOR PRONUNCIATION ONLY` (`妈` mother = woman + horse for sound `mā`).
+- **Heterogeneous 4-Step Gemini Pipeline & Cost Guards**:
+  - **Steps 1–3 (`Project A · $0 Free Tier`)**: `gemini-3.5-flash-lite` (`T=0.10`) -> `gemini-3-flash-preview` (`T=0.85`) -> `gemini-3.1-flash-lite` (`T=0.15` strict JSON).
+  - **Step 4 (`Project B · $0.034/img Flash Tier`)**: `gemini-3.1-flash-lite-image` (`T=0.60`, cascading to `gemini-nano-banana-2.1` on `429`/`503`) rendering a `1:1` zero-text absurd component scene.
+  - Built-in cost guards: stored showcase/deck cards (`0` API calls on view), **`Text Steps Only ($0 Preview)`** switch + **`Render Scene ($0.034)`** upgrade action, server-side **`DAILY_IMAGE_CAP=40`**, and automatic Free-Tier model cascades.
 
 ## Quick Start
 
-1. Copy `.env.example` to `.env.local` and configure your AI Joke Lab Supabase credentials (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) and provider API keys (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENAI_MODEL=gpt-6-luna,gpt-5.6-luna`, `GEMINI_MODEL=gemini-3-flash-preview`, `GENERATION_ENABLED=true`).
-2. Run `supabase/week8_migration.sql` once in your Supabase SQL Editor (idempotent additive migration).
-3. Install dependencies and verify checks:
+1. Copy `.env.example` to `.env.local` and set your shared Database A Supabase credentials (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) plus `GEMINI_API_KEY` and `GEMINI_PAID_API_KEY`.
+2. Apply `supabase/week9_migration.sql` in the Supabase SQL Editor (idempotent; isolated under `app_scope = 'hanzi_mnemonic'` and `mix_weight = 0`).
+3. Install and start:
+   ```bash
+   npm install
+   npm run dev
+   ```
+4. Run lint, unit + PGlite database tests, and production build:
+   ```bash
+   npm run lint
+   npm test
+   npm run build
+   ```
 
-```bash
-npm install
-npx tsc --noEmit
-npm run lint
-npm test
-npm run test:db
-npm run build
-npm run dev
-```
+## Open-Source Data Licenses
 
-Open `http://localhost:3002` and sign in with a Google account whose `public.profiles.is_superadmin` is `TRUE`.
-
-## Deployment notes (2026-11-02)
-
-Next.js and eslint-config-next updated to 16.4.4 following npm audit. Windows database-test entry detection corrected. For the existing AI Joke Lab Week 8 database, apply `supabase/week8_studio_addition.sql`: it preserves existing policies and arena data, adds the runs table / atomic reorder RPC / visual chain, and does not seed demonstration runs as real history.
+See `./licenses/`:
+- `licenses/COPYING` & `licenses/LGPL` — Make Me a Hanzi `dictionary.txt` (GNU LGPL v3+).
+- `licenses/APL/` — Make Me a Hanzi `graphics.txt` (Arphic Public License).
+- `licenses/CC-CEDICT-LICENSE.txt` — CC-CEDICT compound readings & glosses (CC BY-SA 4.0).
